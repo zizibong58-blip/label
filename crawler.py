@@ -1,0 +1,295 @@
+import os, re, json, time, requests
+from pathlib import Path
+from datetime import datetime
+import google.generativeai as genai
+from dotenv import load_dotenv
+
+load_dotenv()  # ✅ FIX: .env 파일에서 환경변수 로드
+
+# ─── 1. API 키 및 DB 설정 (하드코딩 제거, 환경변수에서 로드) ─────────────
+NAVER_CLIENT_ID     = os.environ.get("NAVER_CLIENT_ID")
+NAVER_CLIENT_SECRET = os.environ.get("NAVER_CLIENT_SECRET")
+GEMINI_API_KEY      = os.environ.get("GEMINI_API_KEY")
+SUPABASE_URL        = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY        = os.environ.get("SUPABASE_KEY")
+
+if not all([NAVER_CLIENT_ID, NAVER_CLIENT_SECRET, GEMINI_API_KEY, SUPABASE_URL, SUPABASE_KEY]):
+    raise RuntimeError("❌ .env 파일에 필요한 키가 없습니다. .env.example을 참고해서 .env를 만들어주세요.")
+
+# ✅ NEW: GitHub Actions 등 클라우드 러너용 스위치.
+# upload_to_supabase.py는 image_url만 Supabase에 올리고 local_image는 쓰지 않으므로,
+# 로컬 PC가 아닌 곳에서 돌릴 땐 썸네일 다운로드를 건너뛰어 시간/대역폭을 아낄 수 있음.
+SKIP_LOCAL_IMAGE_DOWNLOAD = os.environ.get("SKIP_LOCAL_IMAGE_DOWNLOAD", "false").lower() == "true"
+
+genai.configure(api_key=GEMINI_API_KEY)
+ai_model = genai.GenerativeModel('gemini-2.5-flash', generation_config={"response_mime_type": "application/json"})
+HEADERS = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+
+BRANDS_FILE = "brands.txt"
+STORES_FILE = "stores.txt"
+OUTPUT_DIR  = Path("./label_data")
+IMAGE_DIR   = OUTPUT_DIR / "images"
+OUTPUT_FILE = OUTPUT_DIR / "products.json"
+
+OUTPUT_DIR.mkdir(exist_ok=True)
+IMAGE_DIR.mkdir(exist_ok=True)
+
+IMAGE_PRIORITY = {
+    "samtandbyme": 1, "grove": 2, "muniate": 3, "leidu": 4, "staynoah": 5, 
+    "bernadette1": 6, "nunedestore": 7, "enough_": 8, "alico": 9, "lanic-u": 10, 
+    "beaucla": 11, "pinkholicya": 12, "neulpumdaa": 13, "mou9": 14, "lasibelle": 15, 
+    "carinowm": 16, "ttoyuni": 17, "occupe": 18, "nowadays_": 19, "themellow": 20, 
+    "bei-an": 21, "sundaymorningmaket": 22, "sweet_i": 23, "lunadeel": 24, "butterpezl": 25
+}
+
+STORE_MAPPING = {
+    "ttoyuni": ["ttoyuni", "또유니"], "occupe": ["오큐페", "occupe"], "leidu": ["레이두", "leidu"], 
+    "enough_": ["이너프", "enough", "enough_"], "nowadays_": ["나우어데이즈", "나우 어 데이즈", "nowadays", "nowadays_"],
+    "staynoah": ["스테이노아", "staynoah"], "themellow": ["더멜로우", "themellow"],
+    "bernadette1": ["버나뎃", "bernadette", "bernadette1"], "muniate": ["무니에트", "muniate"],
+    "bei-an": ["바이안", "bei-an"], "sundaymorningmaket": ["선데이모닝마켓", "sundaymorningmaket", "선데이모닝"],
+    "sweet_i": ["스윗아이", "스윗 아이", "sweet_i"], "lunadeel": ["루나드엘", "lunadeel"], "butterpezl": ["버터프레즐", "butterpezl"], 
+    "nunedestore": ["누네드", "nunedestore", "누네드스토어"], "samtandbyme": ["그로브", "grove", "grove_store", "샘트앤바이미", "samtandbyme"], 
+    "alico": ["알리코", "alico"], "lanic-u": ["라니쿠", "lanic-u"], "beaucla": ["보클레", "beaucla"], "pinkholicya": ["핑크홀릭", "pinkholicya"], 
+    "neulpumdaa": ["늘품다", "neulpumdaa"], "mou9": ["모구", "mou9"], "lasibelle": ["라시벨", "lasibelle"], "carinowm": ["카리노", "carinowm"]
+}
+CATEGORIES = ["50000167", "50000190", "50000174"] 
+
+def load_list(filename):
+    if not os.path.exists(filename): return []
+    with open(filename, "r", encoding="utf-8") as f: return [l.strip() for l in f if l.strip()]
+
+def get_split_rules():
+    try:
+        res = requests.get(f"{SUPABASE_URL}/rest/v1/split_rules?select=product_url,correct_title", headers=HEADERS)
+        return {item['product_url']: item['correct_title'] for item in res.json()} if res.status_code == 200 else {}
+    except: return {}
+
+def get_rename_rules():
+    try:
+        res = requests.get(f"{SUPABASE_URL}/rest/v1/rename_rules?select=original_title,correct_title", headers=HEADERS)
+        return {item['original_title']: item['correct_title'] for item in res.json()} if res.status_code == 200 else {}
+    except: return {}
+
+# ✅ FIX: 어드민 패널의 '합치기(🔗)' 기능이 실제로 반영되도록 merge_rules를 읽어오는 함수 추가
+def get_merge_rules():
+    """{원본 링크 URL: 합쳐질 대상 상품의 '브랜드|상품명'} 형태로 반환"""
+    try:
+        res = requests.get(f"{SUPABASE_URL}/rest/v1/merge_rules?select=product_url,target_clean_title", headers=HEADERS)
+        return {item['product_url']: item['target_clean_title'] for item in res.json()} if res.status_code == 200 else {}
+    except: return {}
+
+# ✅ FIX: 어드민 패널의 '삭제(🗑️)' 기능이 실제로 반영되도록 blacklist를 읽어오는 함수 추가
+def get_blacklist():
+    """다시 크롤링에 포함하지 않을 URL 집합"""
+    try:
+        res = requests.get(f"{SUPABASE_URL}/rest/v1/blacklist?select=product_url", headers=HEADERS)
+        return {item['product_url'] for item in res.json()} if res.status_code == 200 else set()
+    except: return set()
+
+def is_target_store(mall_name, link, store_ids):
+    mall_name_clean = mall_name.replace(" ", "").lower()
+    if "enoughroom" in mall_name_clean: return None
+    extended_store_ids = set(store_ids + ["grove", "samtandbyme"])
+
+    for sid in extended_store_ids:
+        if f"smartstore.naver.com/{sid}/" in link.lower() or f"smartstore.naver.com/{sid}?" in link.lower(): return sid
+        for alias in STORE_MAPPING.get(sid, [sid]):
+            alias_clean = alias.replace(" ", "").lower()
+            if alias_clean == mall_name_clean: return sid
+            if any("\uac00" <= c <= "\ud7a3" for c in alias_clean) and alias_clean in mall_name_clean: return sid
+    return None
+
+def search_naver(keyword, cat=None, display=100, sort="date"):
+    headers = {"X-Naver-Client-Id": NAVER_CLIENT_ID, "X-Naver-Client-Secret": NAVER_CLIENT_SECRET}
+    params = {"query": keyword, "display": display, "sort": sort}
+    if cat: params["category"] = cat
+    try: return requests.get("https://openapi.naver.com/v1/search/shop.json", headers=headers, params=params).json().get("items", [])
+    except: return []
+
+def download_image(url, product_id):
+    try:
+        folder = IMAGE_DIR / str(product_id).replace("|", "_"); folder.mkdir(exist_ok=True)
+        path = folder / "main.jpg"
+        if path.exists(): return str(path)
+        path.write_bytes(requests.get(url, timeout=10).content)
+        return str(path)
+    except: return None
+
+def get_reviews(product_id, count=5):
+    # ✅ FIX: product_id가 없으면(=진짜 네이버 상품ID를 못 구했으면) API를 호출하지 않고 바로 빈 리스트 반환
+    if not product_id:
+        return []
+    try:
+        data = requests.get(f"https://api.review.naver.com/v0.1/reviews/headlines?productId={product_id}&page=1&pageSize={count}", timeout=5).json()
+        return [{"score": r.get("score"), "content": r.get("content", "")[:100], "date": r.get("createDate", "")} for r in data.get("reviews", [])]
+    except: return []
+
+def clean_titles_with_ai(titles):
+    print(f"\n🤖 제미나이 AI가 {len(titles)}개의 상품명을 분석합니다...")
+    cleaned_dict = {}
+    unique_titles = list(set(titles))
+    batch_size = 40 
+    for i in range(0, len(unique_titles), batch_size):
+        batch = unique_titles[i:i+batch_size]
+        prompt = f"""너는 패션 MD야. 
+[규칙]
+1. 홍보 단어(무료배송, 당일출고 등)와 도매택 지우기. 대괄호 절대 금지.
+2. 원본에서 도매택 바로 뒤 단어가 '메인 고유명'이다.
+3. 형식: "고유상품명 + 카테고리"
+입력: {json.dumps(batch, ensure_ascii=False)}
+출력: [ {{"original": "원본", "clean_title": "정답"}} ]"""
+        try:
+            res = ai_model.generate_content(prompt)
+            for p in json.loads(res.text):
+                cleaned_dict[p.get("original", "")] = p.get("clean_title", "").replace("[", "").replace("]", "").strip()
+        except Exception:
+            for t in batch: cleaned_dict[t] = t 
+        print(f"  [{min(i+batch_size, len(unique_titles))}/{len(unique_titles)}] 분석 완료...")
+        time.sleep(3) 
+    return cleaned_dict
+
+def run():
+    brands = load_list(BRANDS_FILE)
+    store_ids = load_list(STORES_FILE)
+    if not brands or not store_ids: return
+    
+    split_rules = get_split_rules()
+    rename_rules = get_rename_rules()
+    merge_rules = get_merge_rules()   # ✅ FIX
+    blacklist = get_blacklist()       # ✅ FIX
+    print(f"🚀 LABEL V2 가동 (도매택 {len(brands)}개 / 소매상 {len(store_ids)}개 / 휴먼분리 {len(split_rules)}건 / 병합 {len(merge_rules)}건 / 블랙리스트 {len(blacklist)}건 적용)\n")
+    
+    brand_lower_list = [b.replace(" ", "").lower() for b in brands]
+    raw_titles_to_clean = []
+    seen_raw_titles = set()
+    
+    extended_store_ids = list(set(store_ids + ["grove"]))
+
+    for sid in extended_store_ids:
+        search_kw = STORE_MAPPING.get(sid, [sid])[0]
+        for cat in CATEGORIES:
+            items = search_naver(search_kw, cat=cat, display=100, sort="date")
+            for item in items:
+                mall_name, link = item.get("mallName", ""), item.get("link", "")
+                if not is_target_store(mall_name, link, store_ids) == sid: continue
+                
+                clean_link = link.split("?")[0].strip()
+                if clean_link in blacklist: continue  # ✅ FIX: 삭제된 링크는 재수집하지 않음
+                if clean_link in split_rules or clean_link in merge_rules: continue  # ✅ FIX: 병합 대상도 원본 제목 재정제 스킵
+
+                raw_title = re.sub(r"<[^>]+>", "", item.get("title", ""))
+                raw_title_lower = raw_title.replace(" ", "").lower()
+                for b, b_lower in zip(brands, brand_lower_list):
+                    if b_lower in raw_title_lower:
+                        if raw_title not in seen_raw_titles:
+                            seen_raw_titles.add(raw_title)
+                            raw_titles_to_clean.append(raw_title)
+                        break 
+        time.sleep(0.3)
+
+    cleaned_map = clean_titles_with_ai(raw_titles_to_clean) if raw_titles_to_clean else {}
+
+    print("\n🔍 정제 및 어드민 수정본 매칭 기반 전체 탐색 시작...")
+    grouped_products = {}
+    unique_items = set()
+    
+    for raw_t in raw_titles_to_clean:
+        clean_t = cleaned_map.get(raw_t, "")
+        if not clean_t: continue
+        matched_brand = next((b for b, b_lower in zip(brands, brand_lower_list) if b_lower in raw_t.replace(" ", "").lower()), None)
+        if matched_brand: unique_items.add((matched_brand, clean_t))
+            
+    for correct_title in split_rules.values():
+        if "|" in correct_title:
+            b_name, c_title = correct_title.split("|", 1)
+            unique_items.add((b_name.strip(), c_title.strip()))
+
+    for brand, clean_title in unique_items:
+        search_query = f"{brand} {clean_title}"
+        items = search_naver(search_query, display=100, sort="sim") 
+        
+        for item in items:
+            mall_name, link = item.get("mallName", ""), item.get("link", "")
+            clean_link = link.split("?")[0].strip()
+            if clean_link in blacklist: continue  # ✅ FIX: 2단계 탐색에서도 삭제된 링크 제외
+            store_id = is_target_store(mall_name, link, store_ids)
+            if not store_id: continue
+            
+            # ✅ FIX: 병합 규칙이 있으면, 이 링크가 어떤 검색어에서 나왔든 상관없이
+            # 지정된 대상 상품(target_clean_title)으로 강제 편입시킨다.
+            forced_merge = merge_rules.get(clean_link)
+            if forced_merge and "|" in forced_merge:
+                dedup_key = forced_merge
+            else:
+                forced_title = split_rules.get(clean_link)
+                if forced_title:
+                    forced_brand, forced_clean_title = forced_title.split("|", 1)
+                    if brand != forced_brand.strip() or clean_title != forced_clean_title.strip(): continue 
+                    dedup_key = forced_title 
+                else:
+                    raw_title_nospace = re.sub(r"<[^>]+>", "", item.get("title", "")).replace(" ", "").lower()
+                    clean_words = clean_title.split()
+                    if not clean_words: continue
+                    
+                    main_keyword = clean_words[0].lower() 
+                    category_keyword = clean_words[-1].lower() 
+                    brand_nospace = brand.replace(" ", "").lower() 
+                    
+                    if (brand_nospace + main_keyword) not in raw_title_nospace: continue 
+                    if category_keyword not in raw_title_nospace: continue 
+                    dedup_key = f"{brand}|{clean_title}"
+            
+            if dedup_key not in grouped_products:
+                grouped_products[dedup_key] = {
+                    # ✅ FIX: brand_name을 loop 변수(brand)가 아니라 dedup_key에서 파생시킴.
+                    # 병합(forced_merge)된 경우 대상 상품의 브랜드와 현재 검색 loop의 brand가 다를 수 있기 때문.
+                    "brand_name": dedup_key.split("|")[0], "title": dedup_key.split("|")[1], "clean_title": dedup_key, 
+                    "image_url": item.get("image", ""), 
+                    "product_id": dedup_key, # 🔥 핵심: 네이버 ID 대신 불변의 '도매택|상품명'을 고유 ID로 콱 박아버립니다!
+                    "crawled_at": datetime.now().isoformat(), "store_links": [],
+                    "_best_prio": IMAGE_PRIORITY.get(store_id, 99)
+                }
+            
+            existing_stores = [l['store_id'] for l in grouped_products[dedup_key]["store_links"]]
+            if store_id not in existing_stores:
+                grouped_products[dedup_key]["store_links"].append({
+                    "store_name": mall_name, "store_id": store_id,
+                    "price": int(item.get("lprice", "0")), "product_url": link,
+                    "store_title": re.sub(r"<[^>]+>", "", item.get("title", "")),
+                    "store_image": item.get("image", ""),
+                    "naver_product_id": item.get("productId", "")  # ✅ FIX: 리뷰 조회용 진짜 네이버 상품ID 보관
+                })
+                new_prio = IMAGE_PRIORITY.get(store_id, 99)
+                if new_prio < grouped_products[dedup_key]["_best_prio"]:
+                    grouped_products[dedup_key]["image_url"] = item.get("image", "")
+                    grouped_products[dedup_key]["_best_prio"] = new_prio
+
+    final_data = []
+    print("\n📸 썸네일 다운 및 리뷰 수집 중...")
+    for dedup_key, p in grouped_products.items():
+        if dedup_key in rename_rules:
+            p["title"] = rename_rules[dedup_key].split("|")[-1]
+            
+        # ✅ NEW: 클라우드 러너(SKIP_LOCAL_IMAGE_DOWNLOAD=true)에서는 다운로드 생략, 로컬에서는 기존대로 동작
+        p["local_image"] = None if SKIP_LOCAL_IMAGE_DOWNLOAD else download_image(p["image_url"], p["product_id"])
+
+        # ✅ FIX: 예전엔 p["product_id"](="브랜드|상품명" 문자열)를 그대로 네이버 리뷰 API에 넘겨서
+        # 항상 실패(빈 배열)했음. 이제 store_links 중 우선순위가 가장 높은 곳의 진짜 네이버 productId를 사용.
+        review_pid = None
+        if p["store_links"]:
+            sorted_by_prio = sorted(p["store_links"], key=lambda l: IMAGE_PRIORITY.get(l["store_id"], 99))
+            for l in sorted_by_prio:
+                if l.get("naver_product_id"):
+                    review_pid = l["naver_product_id"]
+                    break
+        p["reviews"] = get_reviews(review_pid)
+
+        del p["_best_prio"]
+        final_data.append(p)
+
+    OUTPUT_FILE.write_text(json.dumps(final_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\n🎉 갓벽 정제 완료! 총 {len(final_data)}개의 유일 상품 데이터 완성 -> {OUTPUT_FILE}")
+
+if __name__ == "__main__":
+    run()

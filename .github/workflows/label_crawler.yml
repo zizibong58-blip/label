@@ -1,0 +1,44 @@
+name: LABEL 크롤러 자동 실행
+
+on:
+  schedule:
+    - cron: '0 22 * * *'   # 매일 07:00 KST (UTC 22:00 전날)
+    - cron: '0 12 * * *'   # 매일 21:00 KST (UTC 12:00)
+  workflow_dispatch: {}     # Actions 탭에서 수동으로도 실행 가능
+
+jobs:
+  crawl-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 의존성 설치
+        run: pip install -r requirements.txt
+
+      - name: 크롤러 실행 (products.json 생성)
+        env:
+          NAVER_CLIENT_ID: ${{ secrets.NAVER_CLIENT_ID }}
+          NAVER_CLIENT_SECRET: ${{ secrets.NAVER_CLIENT_SECRET }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          SKIP_LOCAL_IMAGE_DOWNLOAD: "true"
+        run: python crawler.py
+
+      - name: Supabase 업로드 (upsert)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python upload_to_supabase.py
+
+      - name: 실패 시 로그 남기기
+        if: failure()
+        run: echo "❌ 크롤링 또는 업로드 실패 — 위 로그에서 어느 step인지 확인하세요."
