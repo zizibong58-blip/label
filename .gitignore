@@ -2,6 +2,3 @@
 __pycache__/
 label_data/
 *.pyc
-App.js
-App.css
-supabase.js

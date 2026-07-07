@@ -11,9 +11,13 @@ NAVER_CLIENT_ID     = os.environ.get("NAVER_CLIENT_ID")
 NAVER_CLIENT_SECRET = os.environ.get("NAVER_CLIENT_SECRET")
 GEMINI_API_KEY      = os.environ.get("GEMINI_API_KEY")
 SUPABASE_URL        = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY        = os.environ.get("SUPABASE_KEY")
+# ✅ FIX: anon(publishable) key 대신 service_role key 사용.
+# RLS로 products/store_links 등에 대한 anon 직접 쓰기를 막았기 때문에,
+# 크롤러(신뢰된 백엔드 프로세스)는 RLS를 우회하는 service_role key로 써야 정상 동작함.
+# service_role key는 절대 프론트엔드/브라우저에 노출하면 안 됨 — 이 .env는 서버(크롤러)에서만 사용.
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 
-if not all([NAVER_CLIENT_ID, NAVER_CLIENT_SECRET, GEMINI_API_KEY, SUPABASE_URL, SUPABASE_KEY]):
+if not all([NAVER_CLIENT_ID, NAVER_CLIENT_SECRET, GEMINI_API_KEY, SUPABASE_URL, SUPABASE_SERVICE_KEY]):
     raise RuntimeError("❌ .env 파일에 필요한 키가 없습니다. .env.example을 참고해서 .env를 만들어주세요.")
 
 # ✅ NEW: GitHub Actions 등 클라우드 러너용 스위치.
@@ -23,7 +27,7 @@ SKIP_LOCAL_IMAGE_DOWNLOAD = os.environ.get("SKIP_LOCAL_IMAGE_DOWNLOAD", "false")
 
 genai.configure(api_key=GEMINI_API_KEY)
 ai_model = genai.GenerativeModel('gemini-2.5-flash', generation_config={"response_mime_type": "application/json"})
-HEADERS = {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}
+HEADERS = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
 
 BRANDS_FILE = "brands.txt"
 STORES_FILE = "stores.txt"

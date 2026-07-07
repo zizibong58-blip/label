@@ -5,28 +5,29 @@ from dotenv import load_dotenv
 load_dotenv()  # ✅ .env 파일에서 환경변수 로드
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+# ✅ FIX: anon key 대신 service_role key — RLS로 anon 직접 쓰기를 막았기 때문에 필요
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("❌ .env 파일에 SUPABASE_URL / SUPABASE_KEY가 없습니다. .env.example을 참고해서 .env를 만들어주세요.")
+if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+    raise RuntimeError("❌ .env 파일에 SUPABASE_URL / SUPABASE_SERVICE_KEY가 없습니다. .env.example을 참고해서 .env를 만들어주세요.")
 
 # upsert(merge-duplicates)용 헤더 — product_id 충돌 시 payload에 없는 컬럼(click_count 등)은 건드리지 않고 유지됨
 UPSERT_HEADERS = {
-    "apikey": SUPABASE_KEY,
-    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "apikey": SUPABASE_SERVICE_KEY,
+    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
     "Content-Type": "application/json",
     "Prefer": "resolution=merge-duplicates,return=representation"
 }
 # store_links 삭제/삽입용 헤더 (단순 delete/insert라 merge-duplicates 불필요)
 WRITE_HEADERS = {
-    "apikey": SUPABASE_KEY,
-    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "apikey": SUPABASE_SERVICE_KEY,
+    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
     "Content-Type": "application/json",
     "Prefer": "return=representation"
 }
 DELETE_HEADERS = {
-    "apikey": SUPABASE_KEY,
-    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "apikey": SUPABASE_SERVICE_KEY,
+    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
 }
 
 DATA_FILE = Path("./label_data/products.json")
