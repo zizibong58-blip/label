@@ -2,8 +2,10 @@ name: LABEL 크롤러 자동 실행
 
 on:
   schedule:
-    - cron: '0 22 * * *'   # 매일 07:00 KST (UTC 22:00 전날)
-    - cron: '0 12 * * *'   # 매일 21:00 KST (UTC 12:00)
+    - cron: '0 21 * * *'   # 매일 06:00 KST (UTC 21:00 전날)
+    - cron: '0 3 * * *'    # 매일 12:00 KST (UTC 03:00)
+    - cron: '0 9 * * *'    # 매일 18:00 KST (UTC 09:00)
+    - cron: '0 15 * * *'   # 매일 00:00 KST (UTC 15:00 전날)
   workflow_dispatch: {}     # Actions 탭에서 수동으로도 실행 가능
 
 jobs:

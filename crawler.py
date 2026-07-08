@@ -26,7 +26,7 @@ if not all([NAVER_CLIENT_ID, NAVER_CLIENT_SECRET, GEMINI_API_KEY, SUPABASE_URL, 
 SKIP_LOCAL_IMAGE_DOWNLOAD = os.environ.get("SKIP_LOCAL_IMAGE_DOWNLOAD", "false").lower() == "true"
 
 genai.configure(api_key=GEMINI_API_KEY)
-ai_model = genai.GenerativeModel('gemini-2.5-flash', generation_config={"response_mime_type": "application/json"})
+ai_model = genai.GenerativeModel('gemini-2.5-flash', generation_config={"response_mime_type": "application/json", "temperature": 0})
 HEADERS = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
 
 BRANDS_FILE = "brands.txt"
@@ -168,7 +168,7 @@ def run():
     raw_titles_to_clean = []
     seen_raw_titles = set()
     
-    extended_store_ids = list(set(store_ids + ["grove"]))
+    extended_store_ids = list(set(store_ids + ["samtandbyme"]))
 
     for sid in extended_store_ids:
         search_kw = STORE_MAPPING.get(sid, [sid])[0]
@@ -186,9 +186,14 @@ def run():
                 raw_title_lower = raw_title.replace(" ", "").lower()
                 for b, b_lower in zip(brands, brand_lower_list):
                     if b_lower in raw_title_lower:
-                        if raw_title not in seen_raw_titles:
-                            seen_raw_titles.add(raw_title)
-                            raw_titles_to_clean.append(raw_title)
+                        # ✅ FIX: "forest 포레스트 도브 프릴 블라우스"처럼 진짜 도매택(포레스트) 앞에
+                        # 영문 별칭/홍보문구가 붙어있으면 AI가 매번 다르게 정제해서 같은 상품이
+                        # 중복 그룹으로 쌓이는 원인이 됨. 실제 매칭된 도매택 위치부터 잘라서 넘김.
+                        brand_pos = raw_title.lower().find(b.lower())
+                        trimmed_title = raw_title[brand_pos:] if brand_pos > 0 else raw_title
+                        if trimmed_title not in seen_raw_titles:
+                            seen_raw_titles.add(trimmed_title)
+                            raw_titles_to_clean.append(trimmed_title)
                         break 
         time.sleep(0.3)
 
@@ -209,6 +214,8 @@ def run():
             b_name, c_title = correct_title.split("|", 1)
             unique_items.add((b_name.strip(), c_title.strip()))
 
+    assigned_links = set()  # ✅ NEW: 이번 크롤링에서 이미 어떤 상품군에 배정된 링크(URL) 추적 — 같은 리스팅이 여러 그룹에 중복 편입되는 것 방지
+
     for brand, clean_title in unique_items:
         search_query = f"{brand} {clean_title}"
         items = search_naver(search_query, display=100, sort="sim") 
@@ -219,6 +226,10 @@ def run():
             if clean_link in blacklist: continue  # ✅ FIX: 2단계 탐색에서도 삭제된 링크 제외
             store_id = is_target_store(mall_name, link, store_ids)
             if not store_id: continue
+
+            # ✅ NEW: 이미 다른 (brand, clean_title) 검색에서 어떤 상품군에 배정된 링크면 건너뜀.
+            # AI가 같은 상품을 여러 이름으로 정제해도, 실제 링크는 딱 한 곳에만 속하게 됨.
+            if clean_link in assigned_links: continue
             
             # ✅ FIX: 병합 규칙이 있으면, 이 링크가 어떤 검색어에서 나왔든 상관없이
             # 지정된 대상 상품(target_clean_title)으로 강제 편입시킨다.
@@ -268,6 +279,9 @@ def run():
                 if new_prio < grouped_products[dedup_key]["_best_prio"]:
                     grouped_products[dedup_key]["image_url"] = item.get("image", "")
                     grouped_products[dedup_key]["_best_prio"] = new_prio
+
+            # ✅ NEW: 이 링크는 이제 dedup_key에 확정 배정됨 — 이후 다른 검색어 반복에서 재사용 안 함
+            assigned_links.add(clean_link)
 
     final_data = []
     print("\n📸 썸네일 다운 및 리뷰 수집 중...")
