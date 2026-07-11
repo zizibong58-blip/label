@@ -171,6 +171,10 @@ def clean_titles_with_ai(titles_by_brand):
 형태 단어를 카테고리로 써. (예: "나시 니트" → 카테고리는 "나시", 니트는 소재라서 삭제)
 형태 단어 없이 소재 단어만 있으면 그 소재 단어를 카테고리로 써.
 
+동의어는 반드시 목록에 있는 단어로 통일해. 같은 옷을 다른 단어로 부른 것뿐이면 절대 원본 단어를 그대로 쓰지 마:
+- 탑, 슬리브리스탑, 나시탑, 민소매, 나시티, 나시 티셔츠 → 전부 "나시"로 통일
+- 니트탑, 니트웨어 → "니트"로 통일
+
 [출력 형식]
 반드시 "상품명키워드 카테고리키워드" 순서로, 공백 하나로 구분된 두 단어만.
 
@@ -182,13 +186,30 @@ def clean_titles_with_ai(titles_by_brand):
 원본: riette 리에뜨 로이 니트 썸머 린넨 반팔 오프숄더 크롭 nt (3col) 나우 어 데이즈클릭 0
 정답: 로이 니트
 
+원본: 파운더스 파르마 슬리브리스 탑
+(다른 상품명에선 같은 상품이 "파르마 나시"로도 불림 → "탑"은 "나시"의 동의어일 뿐, 다른 카테고리가 아님)
+정답: 파르마 나시
+
+원본: 파운더스 이네스 유넥 슬리브리스 코튼 나시 티셔츠
+(유넥/슬리브리스/코튼은 디테일·소재라 삭제, "나시"와 "티셔츠"가 동시에 있으면 더 구체적인 "나시"를 카테고리로)
+정답: 이네스 나시
+
 입력: {json.dumps(batch, ensure_ascii=False)}
 출력: [ {{"original": "원본", "clean_title": "정답"}} ]"""
-            try:
-                res = ai_model.generate_content(prompt)
-                for p in json.loads(res.text):
-                    cleaned_dict[p.get("original", "")] = p.get("clean_title", "").replace("[", "").replace("]", "").strip()
-            except Exception:
+            success = False
+            for attempt in range(3):
+                try:
+                    res = ai_model.generate_content(prompt)
+                    for p in json.loads(res.text):
+                        cleaned_dict[p.get("original", "")] = p.get("clean_title", "").replace("[", "").replace("]", "").strip()
+                    success = True
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        print(f"  ⚠️ [{brand}] 배치 실패({e}), 재시도 {attempt+1}/2...")
+                        time.sleep(5 * (attempt + 1))
+            if not success:
+                print(f"  ❌ [{brand}] 3회 재시도 실패 — 이 배치는 원본 제목이 그대로 저장됩니다.")
                 for t in batch: cleaned_dict[t] = t
             print(f"  [{brand}] {min(i+batch_size, len(unique_titles))}/{len(unique_titles)} 분석 완료...")
             time.sleep(3)
@@ -224,13 +245,17 @@ def run():
                 if clean_link in split_rules or clean_link in merge_rules: continue  # ✅ FIX: 병합 대상도 원본 제목 재정제 스킵
 
                 raw_title = re.sub(r"<[^>]+>", "", item.get("title", ""))
+                # ✅ FIX: 소매상이 앞에 붙이는 자체 태그는 항상 대괄호 안에 있음
+                # (예: "[MUNIATE/무니에트]") — 브랜드 매칭 전에 통째로 제거해서 애초에 후보에서 배제.
+                raw_title = re.sub(r"\[[^\]]*\]", "", raw_title).strip()
                 raw_title_lower = raw_title.replace(" ", "").lower()
-                # ✅ FIX: 브랜드가 여러 개 동시에 매칭되면(예: 소매상이 앞에 자체 태그를 붙인 경우)
-                # brands.txt 리스트 순서상 먼저 걸리는 걸 쓰지 않고, 원본 제목에서 가장 나중에(뒤에)
-                # 등장하는 브랜드를 진짜 도매택으로 본다. 앞쪽 태그는 소매상이 임의로 붙인 래퍼인 경우가 많음.
+                # ✅ FIX: 대괄호 태그를 이미 제거했으므로, 남은 텍스트에서 여러 브랜드가 동시에
+                # 매칭되더라도 가장 먼저(앞에) 나오는 브랜드가 진짜 도매택이다.
+                # ("코드/영문표기 + 진짜브랜드 + 상품명 + 카테고리" 순서가 일관된 패턴이라
+                # 뒤에 나오는 매칭은 다른 브랜드명과 우연히 겹치는 상품명/디테일어인 경우가 많음)
                 matched = [(raw_title.lower().find(b.lower()), b) for b, b_lower in zip(brands, brand_lower_list) if b_lower in raw_title_lower]
                 if matched:
-                    brand_pos, b = max(matched, key=lambda x: x[0])
+                    brand_pos, b = min(matched, key=lambda x: x[0])
                     trimmed_title = raw_title[brand_pos:] if brand_pos > 0 else raw_title
                     if trimmed_title not in seen_raw_titles:
                         seen_raw_titles.add(trimmed_title)
@@ -239,15 +264,34 @@ def run():
 
     cleaned_map = clean_titles_with_ai(titles_by_brand) if titles_by_brand else {}
 
+    # ✅ FIX: 같은 (브랜드, 상품명키워드)인데 AI가 카테고리 단어를 다르게 뽑아서
+    # (예: "파르마 나시" vs "파르마 티셔츠") 서로 다른 dedup_key로 쪼개지는 문제 방지.
+    # 개별 동의어를 프롬프트에 하나씩 추가하는 방식은 계속 새 케이스가 나와서 한계가 있음 —
+    # 대신 같은 상품명키워드로 묶인 것들끼리 카테고리를 사후에 통일한다.
+    category_votes = {}
+    for brand_b, titles in titles_by_brand.items():
+        for raw_t in titles:
+            clean_t = cleaned_map.get(raw_t, "")
+            parts = clean_t.split()
+            if not parts: continue
+            product_name = parts[0]
+            category = parts[-1] if len(parts) > 1 else parts[0]
+            key = (brand_b, product_name)
+            category_votes.setdefault(key, {})
+            category_votes[key][category] = category_votes[key].get(category, 0) + 1
+
+    final_category = {}
+    for key, votes in category_votes.items():
+        # "나시"가 하나라도 있으면 최우선 (탑/슬리브리스탑/티셔츠 등 표현이 갈리는 경우가 대부분 나시라서),
+        # 그 외엔 가장 많이 나온 카테고리로 통일
+        final_category[key] = "나시" if "나시" in votes else max(votes.items(), key=lambda x: x[1])[0]
+
     print("\n🔍 정제 및 어드민 수정본 매칭 기반 전체 탐색 시작...")
     grouped_products = {}
     unique_items = set()
     
-    for brand_b, titles in titles_by_brand.items():
-        for raw_t in titles:
-            clean_t = cleaned_map.get(raw_t, "")
-            if not clean_t: continue
-            unique_items.add((brand_b, clean_t))
+    for (brand_b, product_name), cat in final_category.items():
+        unique_items.add((brand_b, f"{product_name} {cat}"))
             
     for correct_title in split_rules.values():
         if "|" in correct_title:
