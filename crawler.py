@@ -129,28 +129,69 @@ def get_reviews(product_id, count=5):
         return [{"score": r.get("score"), "content": r.get("content", "")[:100], "date": r.get("createDate", "")} for r in data.get("reviews", [])]
     except: return []
 
-def clean_titles_with_ai(titles):
-    print(f"\n🤖 제미나이 AI가 {len(titles)}개의 상품명을 분석합니다...")
+def clean_titles_with_ai(titles_by_brand):
+    total_titles = sum(len(v) for v in titles_by_brand.values())
+    print(f"\n🤖 제미나이 AI가 {len(titles_by_brand)}개 브랜드, 총 {total_titles}개의 상품명을 분석합니다...")
     cleaned_dict = {}
-    unique_titles = list(set(titles))
-    batch_size = 40 
-    for i in range(0, len(unique_titles), batch_size):
-        batch = unique_titles[i:i+batch_size]
-        prompt = f"""너는 패션 MD야. 
-[규칙]
-1. 홍보 단어(무료배송, 당일출고 등)와 도매택 지우기. 대괄호 절대 금지.
-2. 원본에서 도매택 바로 뒤 단어가 '메인 고유명'이다.
-3. 형식: "고유상품명 + 카테고리"
+    batch_size = 40
+    # ✅ FIX: 브랜드를 섞지 않고 브랜드별로 묶어서 배치 처리.
+    # 같은 브랜드 상품명을 여러 개 같이 보여줘야, 여러 상품에 반복 등장하는
+    # 컬렉션/라인명(필러)과 그 상품에만 있는 진짜 고유 식별어를 AI가 구분할 수 있음.
+    for brand, titles in titles_by_brand.items():
+        unique_titles = list(set(titles))
+        for i in range(0, len(unique_titles), batch_size):
+            batch = unique_titles[i:i+batch_size]
+            prompt = f"""너는 동대문 도매 쇼핑몰 상품명을 정리하는 패션 MD야.
+아래는 전부 같은 도매택 "{brand}" 상품들의 원본 상품명이야.
+
+각 원본 상품명에서 "상품명키워드(1단어)" + "카테고리키워드(1단어)"만 남기고 나머지는 전부 삭제해.
+
+[상품명키워드 판별 기준 - 가장 중요]
+여러 상품명에 걸쳐 공통으로 반복되는 단어(시즌 컬렉션명/라인명처럼 홍보용으로 계속 붙는 단어)는
+진짜 상품명이 아니라 필러야. 삭제해.
+그 상품에서만 고유하게 나타나는 단어가 진짜 상품명키워드야. 그것만 남겨.
+
+[제거 대상 - 전부 삭제, 예외 없음]
+- 도매택/브랜드명 (한글·영문 표기, 중복 표기 모두)
+- 브랜드 바로 뒤에 붙는 의미없는 코드/이니셜/영문 약어 (예: pyt, ss, fw 같은 2~3글자 토큰)
+- 여러 상품에 반복 등장하는 컬렉션/라인명 (위 판별 기준 참고)
+- 소재어: 린넨, 코튼, 텐셀, 울, 쉬폰, 새틴, 골지 등
+- 시즌/계절어: 봄, 여름, 가을, 겨울, 썸머, 당일, 신상, 재진행 등
+- 핏/실루엣 디테일어: 오버핏, 루즈핏, 크롭, 슬림, 슬리브리스, 반팔, 긴팔, 오프숄더, 버튼, 스트라이프 등
+- 옵션/수량 표기: (3col), nt 같은 괄호·약어 표기
+- 소매상 이름, 클릭수 표기 (예: "나우 어 데이즈클릭 0")
+- 홍보 문구: 무료배송, 당일출고, SALE, 하객 등
+- 대괄호[ ] 안 내용 전체, HTML 태그
+
+[카테고리키워드 판별 기준]
+카테고리는 옷의 "형태/종류"를 나타내는 단어여야 해. 아래 목록 중 하나만 골라:
+나시, 블라우스, 셔츠, 니트, 가디건, 원피스, 팬츠, 스커트, 자켓, 티셔츠
+
+형태 단어(나시/블라우스/원피스 등)와 소재 단어(니트/린넨 등)가 같이 있으면
+형태 단어를 카테고리로 써. (예: "나시 니트" → 카테고리는 "나시", 니트는 소재라서 삭제)
+형태 단어 없이 소재 단어만 있으면 그 소재 단어를 카테고리로 써.
+
+[출력 형식]
+반드시 "상품명키워드 카테고리키워드" 순서로, 공백 하나로 구분된 두 단어만.
+
+[예시]
+원본: 프리티영띵 듀이 린넨 나시 니트 슬리브리스 여름 버튼 골지 뷔스티에 nt
+(같은 브랜드의 다른 상품명에도 "프리티영띵"이 반복 등장한다면 → 브랜드명이니까 삭제, "듀이"만 이 상품 고유 식별어)
+정답: 듀이 나시
+
+원본: riette 리에뜨 로이 니트 썸머 린넨 반팔 오프숄더 크롭 nt (3col) 나우 어 데이즈클릭 0
+정답: 로이 니트
+
 입력: {json.dumps(batch, ensure_ascii=False)}
 출력: [ {{"original": "원본", "clean_title": "정답"}} ]"""
-        try:
-            res = ai_model.generate_content(prompt)
-            for p in json.loads(res.text):
-                cleaned_dict[p.get("original", "")] = p.get("clean_title", "").replace("[", "").replace("]", "").strip()
-        except Exception:
-            for t in batch: cleaned_dict[t] = t 
-        print(f"  [{min(i+batch_size, len(unique_titles))}/{len(unique_titles)}] 분석 완료...")
-        time.sleep(3) 
+            try:
+                res = ai_model.generate_content(prompt)
+                for p in json.loads(res.text):
+                    cleaned_dict[p.get("original", "")] = p.get("clean_title", "").replace("[", "").replace("]", "").strip()
+            except Exception:
+                for t in batch: cleaned_dict[t] = t
+            print(f"  [{brand}] {min(i+batch_size, len(unique_titles))}/{len(unique_titles)} 분석 완료...")
+            time.sleep(3)
     return cleaned_dict
 
 def run():
@@ -165,7 +206,7 @@ def run():
     print(f"🚀 LABEL V2 가동 (도매택 {len(brands)}개 / 소매상 {len(store_ids)}개 / 휴먼분리 {len(split_rules)}건 / 병합 {len(merge_rules)}건 / 블랙리스트 {len(blacklist)}건 적용)\n")
     
     brand_lower_list = [b.replace(" ", "").lower() for b in brands]
-    raw_titles_to_clean = []
+    titles_by_brand = {}
     seen_raw_titles = set()
     
     extended_store_ids = list(set(store_ids + ["samtandbyme"]))
@@ -184,30 +225,29 @@ def run():
 
                 raw_title = re.sub(r"<[^>]+>", "", item.get("title", ""))
                 raw_title_lower = raw_title.replace(" ", "").lower()
-                for b, b_lower in zip(brands, brand_lower_list):
-                    if b_lower in raw_title_lower:
-                        # ✅ FIX: "forest 포레스트 도브 프릴 블라우스"처럼 진짜 도매택(포레스트) 앞에
-                        # 영문 별칭/홍보문구가 붙어있으면 AI가 매번 다르게 정제해서 같은 상품이
-                        # 중복 그룹으로 쌓이는 원인이 됨. 실제 매칭된 도매택 위치부터 잘라서 넘김.
-                        brand_pos = raw_title.lower().find(b.lower())
-                        trimmed_title = raw_title[brand_pos:] if brand_pos > 0 else raw_title
-                        if trimmed_title not in seen_raw_titles:
-                            seen_raw_titles.add(trimmed_title)
-                            raw_titles_to_clean.append(trimmed_title)
-                        break 
+                # ✅ FIX: 브랜드가 여러 개 동시에 매칭되면(예: 소매상이 앞에 자체 태그를 붙인 경우)
+                # brands.txt 리스트 순서상 먼저 걸리는 걸 쓰지 않고, 원본 제목에서 가장 나중에(뒤에)
+                # 등장하는 브랜드를 진짜 도매택으로 본다. 앞쪽 태그는 소매상이 임의로 붙인 래퍼인 경우가 많음.
+                matched = [(raw_title.lower().find(b.lower()), b) for b, b_lower in zip(brands, brand_lower_list) if b_lower in raw_title_lower]
+                if matched:
+                    brand_pos, b = max(matched, key=lambda x: x[0])
+                    trimmed_title = raw_title[brand_pos:] if brand_pos > 0 else raw_title
+                    if trimmed_title not in seen_raw_titles:
+                        seen_raw_titles.add(trimmed_title)
+                        titles_by_brand.setdefault(b, []).append(trimmed_title)
         time.sleep(0.3)
 
-    cleaned_map = clean_titles_with_ai(raw_titles_to_clean) if raw_titles_to_clean else {}
+    cleaned_map = clean_titles_with_ai(titles_by_brand) if titles_by_brand else {}
 
     print("\n🔍 정제 및 어드민 수정본 매칭 기반 전체 탐색 시작...")
     grouped_products = {}
     unique_items = set()
     
-    for raw_t in raw_titles_to_clean:
-        clean_t = cleaned_map.get(raw_t, "")
-        if not clean_t: continue
-        matched_brand = next((b for b, b_lower in zip(brands, brand_lower_list) if b_lower in raw_t.replace(" ", "").lower()), None)
-        if matched_brand: unique_items.add((matched_brand, clean_t))
+    for brand_b, titles in titles_by_brand.items():
+        for raw_t in titles:
+            clean_t = cleaned_map.get(raw_t, "")
+            if not clean_t: continue
+            unique_items.add((brand_b, clean_t))
             
     for correct_title in split_rules.values():
         if "|" in correct_title:
@@ -259,7 +299,7 @@ def run():
                 grouped_products[dedup_key] = {
                     # ✅ FIX: brand_name을 loop 변수(brand)가 아니라 dedup_key에서 파생시킴.
                     # 병합(forced_merge)된 경우 대상 상품의 브랜드와 현재 검색 loop의 brand가 다를 수 있기 때문.
-                    "brand_name": dedup_key.split("|")[0], "title": dedup_key.split("|")[1], "clean_title": dedup_key, 
+                    "brand_name": dedup_key.split("|")[0], "title": dedup_key.split("|")[1], "clean_title": dedup_key.split("|")[1], 
                     "image_url": item.get("image", ""), 
                     "product_id": dedup_key, # 🔥 핵심: 네이버 ID 대신 불변의 '도매택|상품명'을 고유 ID로 콱 박아버립니다!
                     "crawled_at": datetime.now().isoformat(), "store_links": [],
@@ -288,6 +328,7 @@ def run():
     for dedup_key, p in grouped_products.items():
         if dedup_key in rename_rules:
             p["title"] = rename_rules[dedup_key].split("|")[-1]
+            p["clean_title"] = p["title"]
             
         # ✅ NEW: 클라우드 러너(SKIP_LOCAL_IMAGE_DOWNLOAD=true)에서는 다운로드 생략, 로컬에서는 기존대로 동작
         p["local_image"] = None if SKIP_LOCAL_IMAGE_DOWNLOAD else download_image(p["image_url"], p["product_id"])
