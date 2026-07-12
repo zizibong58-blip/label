@@ -264,10 +264,27 @@ def run():
 
     cleaned_map = clean_titles_with_ai(titles_by_brand) if titles_by_brand else {}
 
-    # ✅ FIX: 같은 (브랜드, 상품명키워드)인데 AI가 카테고리 단어를 다르게 뽑아서
-    # (예: "파르마 나시" vs "파르마 티셔츠") 서로 다른 dedup_key로 쪼개지는 문제 방지.
-    # 개별 동의어를 프롬프트에 하나씩 추가하는 방식은 계속 새 케이스가 나와서 한계가 있음 —
-    # 대신 같은 상품명키워드로 묶인 것들끼리 카테고리를 사후에 통일한다.
+    # ✅ FIX: split_rules에 이미 같은 (브랜드, 상품명키워드)로 서로 다른 카테고리가
+    # 2개 이상 등록되어 있으면 -> "이 상품명은 실제로 여러 카테고리로 존재한다"고 어드민이
+    # 확인해준 것으로 보고, 그 상품명은 앞으로 다수결 강제 통합 대상에서 아예 제외한다.
+    # (링크 단위로만 기억하면, 나중에 새로 발견되는 다른 판매처 링크가 계속 다수결에
+    # 다시 휩쓸려서 같은 실수가 반복됨 — 상품명 단위로 기억해야 한 번의 판단이 영구 반영됨)
+    no_merge_keys = set()
+    split_categories_by_key = {}
+    for correct_title in split_rules.values():
+        if "|" not in correct_title: continue
+        b_name, c_title = correct_title.split("|", 1)
+        parts = c_title.strip().split()
+        if not parts: continue
+        key = (b_name.strip(), parts[0])
+        split_categories_by_key.setdefault(key, set()).add(parts[-1] if len(parts) > 1 else parts[0])
+    for key, cats in split_categories_by_key.items():
+        if len(cats) > 1:
+            no_merge_keys.add(key)
+
+    # 같은 (브랜드, 상품명키워드) 안에서 AI가 카테고리 단어를 다르게 뽑는 경우
+    # (예: "나시" vs "가디건") no_merge_keys에 없으면 기본은 다수결로 하나로 합친다 —
+    # 도매명+상품명 조합 자체가 대체로 고유해서 진짜 같은 상품일 확률이 높음.
     category_votes = {}
     for brand_b, titles in titles_by_brand.items():
         for raw_t in titles:
@@ -282,17 +299,25 @@ def run():
 
     final_category = {}
     for key, votes in category_votes.items():
-        # "나시"가 하나라도 있으면 최우선 (탑/슬리브리스탑/티셔츠 등 표현이 갈리는 경우가 대부분 나시라서),
-        # 그 외엔 가장 많이 나온 카테고리로 통일
         final_category[key] = "나시" if "나시" in votes else max(votes.items(), key=lambda x: x[1])[0]
 
     print("\n🔍 정제 및 어드민 수정본 매칭 기반 전체 탐색 시작...")
     grouped_products = {}
     unique_items = set()
-    
-    for (brand_b, product_name), cat in final_category.items():
-        unique_items.add((brand_b, f"{product_name} {cat}"))
-            
+
+    for brand_b, titles in titles_by_brand.items():
+        for raw_t in titles:
+            clean_t = cleaned_map.get(raw_t, "")
+            parts = clean_t.split()
+            if not parts: continue
+            product_name = parts[0]
+            key = (brand_b, product_name)
+            if key in no_merge_keys:
+                # 어드민이 이미 여러 카테고리로 나눠놓은 상품명 -> 강제 통합 없이 개별 판단 그대로 사용
+                unique_items.add((brand_b, clean_t))
+            else:
+                unique_items.add((brand_b, f"{product_name} {final_category[key]}"))
+
     for correct_title in split_rules.values():
         if "|" in correct_title:
             b_name, c_title = correct_title.split("|", 1)
