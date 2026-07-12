@@ -27,7 +27,12 @@ SKIP_LOCAL_IMAGE_DOWNLOAD = os.environ.get("SKIP_LOCAL_IMAGE_DOWNLOAD", "false")
 
 genai.configure(api_key=GEMINI_API_KEY)
 ai_model = genai.GenerativeModel('gemini-2.5-flash', generation_config={"response_mime_type": "application/json", "temperature": 0})
-HEADERS = {"apikey": SUPABASE_SERVICE_KEY, "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"}
+# ✅ FIX: Supabase가 신규 키 체계(sb_secret_...)를 도입 — 이건 JWT가 아니라서
+# Authorization: Bearer 헤더에 넣으면 거부됨. apikey 헤더에만 넣어야 함.
+# 예전 JWT 기반 service_role 키(eyJ...)는 계속 Authorization 헤더도 필요해서 키 형식으로 자동 분기.
+HEADERS = {"apikey": SUPABASE_SERVICE_KEY}
+if not SUPABASE_SERVICE_KEY.startswith("sb_"):
+    HEADERS["Authorization"] = f"Bearer {SUPABASE_SERVICE_KEY}"
 
 BRANDS_FILE = "brands.txt"
 STORES_FILE = "stores.txt"
@@ -90,6 +95,26 @@ def get_blacklist():
         res = requests.get(f"{SUPABASE_URL}/rest/v1/blacklist?select=product_url", headers=HEADERS)
         return {item['product_url'] for item in res.json()} if res.status_code == 200 else set()
     except: return set()
+
+# ✅ NEW: 같은 리스팅(링크)이 크롤링마다 AI 정제 결과가 달라져서 서로 다른 상품군으로
+# 갈라지는 것을 막기 위해, 이미 예전 크롤링에서 특정 product_id에 배정된 적 있는
+# 링크 -> product_id 매핑을 가져온다. 이번 AI 결과가 다르게 나와도 이 매핑이 있으면
+# 무조건 기존 상품에 그대로 고정 배정한다 (스토어 상품번호=링크가 곧 정답이므로).
+def get_existing_link_mapping():
+    try:
+        all_rows, page_size, offset = [], 1000, 0
+        while True:
+            res = requests.get(
+                f"{SUPABASE_URL}/rest/v1/store_links?select=product_url,product_id&limit={page_size}&offset={offset}",
+                headers=HEADERS
+            )
+            if res.status_code != 200: break
+            batch = res.json()
+            all_rows.extend(batch)
+            if len(batch) < page_size: break
+            offset += page_size
+        return {row['product_url']: row['product_id'] for row in all_rows}
+    except: return {}
 
 def is_target_store(mall_name, link, store_ids):
     mall_name_clean = mall_name.replace(" ", "").lower()
@@ -176,7 +201,9 @@ def clean_titles_with_ai(titles_by_brand):
 - 니트탑, 니트웨어 → "니트"로 통일
 
 [출력 형식]
-반드시 "상품명키워드 카테고리키워드" 순서로, 공백 하나로 구분된 두 단어만.
+반드시 "상품명키워드 카테고리키워드" 순서로, 공백 하나로 구분된 두 단어.
+단, 브랜드명과 홍보문구 등을 다 지우고 나서 정말로 카테고리 단어 외엔 아무 식별 단어도 안 남으면
+(예: 원본이 "브랜드 + 카테고리"뿐이고 별도 스타일명이 없는 경우) 카테고리 단어를 두 번 쓰지 말고 한 단어만 출력해.
 
 [예시]
 원본: 프리티영띵 듀이 린넨 나시 니트 슬리브리스 여름 버튼 골지 뷔스티에 nt
@@ -193,6 +220,10 @@ def clean_titles_with_ai(titles_by_brand):
 원본: 파운더스 이네스 유넥 슬리브리스 코튼 나시 티셔츠
 (유넥/슬리브리스/코튼은 디테일·소재라 삭제, "나시"와 "티셔츠"가 동시에 있으면 더 구체적인 "나시"를 카테고리로)
 정답: 이네스 나시
+
+원본: 누즈 블라우스
+(브랜드 지우고 나면 "블라우스"라는 카테고리 단어 외엔 진짜 아무것도 안 남음 → 두 번 쓰지 말고 한 단어만)
+정답: 블라우스
 
 입력: {json.dumps(batch, ensure_ascii=False)}
 출력: [ {{"original": "원본", "clean_title": "정답"}} ]"""
@@ -224,6 +255,7 @@ def run():
     rename_rules = get_rename_rules()
     merge_rules = get_merge_rules()   # ✅ FIX
     blacklist = get_blacklist()       # ✅ FIX
+    existing_link_to_pid = get_existing_link_mapping()  # ✅ NEW: 링크별 기존 배정 상품 고정용
     print(f"🚀 LABEL V2 가동 (도매택 {len(brands)}개 / 소매상 {len(store_ids)}개 / 휴먼분리 {len(split_rules)}건 / 병합 {len(merge_rules)}건 / 블랙리스트 {len(blacklist)}건 적용)\n")
     
     brand_lower_list = [b.replace(" ", "").lower() for b in brands]
@@ -351,6 +383,12 @@ def run():
                     forced_brand, forced_clean_title = forced_title.split("|", 1)
                     if brand != forced_brand.strip() or clean_title != forced_clean_title.strip(): continue 
                     dedup_key = forced_title 
+                elif clean_link in existing_link_to_pid:
+                    # ✅ NEW: 이 링크는 예전 크롤링에서 이미 어떤 상품에 배정된 적이 있음.
+                    # 이번 AI 정제 결과(clean_title)가 그때와 다르게 나왔어도 무시하고
+                    # 기존 product_id를 그대로 사용 — 같은 리스팅이 실행마다 다른 이름으로
+                    # 갈라져서 중복 그룹이 생기는 걸 원천 차단.
+                    dedup_key = existing_link_to_pid[clean_link]
                 else:
                     raw_title_nospace = re.sub(r"<[^>]+>", "", item.get("title", "")).replace(" ", "").lower()
                     clean_words = clean_title.split()
