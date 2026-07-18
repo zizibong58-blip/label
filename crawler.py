@@ -406,7 +406,7 @@ def run():
                 grouped_products[dedup_key] = {
                     # ✅ FIX: brand_name을 loop 변수(brand)가 아니라 dedup_key에서 파생시킴.
                     # 병합(forced_merge)된 경우 대상 상품의 브랜드와 현재 검색 loop의 brand가 다를 수 있기 때문.
-                    "brand_name": dedup_key.split("|")[0], "title": dedup_key.split("|")[1], "clean_title": dedup_key.split("|")[1], 
+                    "brand_name": dedup_key.split("|")[0], "title": dedup_key.split("|")[-1], "clean_title": dedup_key.split("|")[-1], 
                     "image_url": item.get("image", ""), 
                     "product_id": dedup_key, # 🔥 핵심: 네이버 ID 대신 불변의 '도매택|상품명'을 고유 ID로 콱 박아버립니다!
                     "crawled_at": datetime.now().isoformat(), "store_links": [],
