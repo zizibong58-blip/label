@@ -129,9 +129,9 @@ def is_target_store(mall_name, link, store_ids):
             if any("\uac00" <= c <= "\ud7a3" for c in alias_clean) and alias_clean in mall_name_clean: return sid
     return None
 
-def search_naver(keyword, cat=None, display=100, sort="date"):
+def search_naver(keyword, cat=None, display=100, sort="date", start=1):
     headers = {"X-Naver-Client-Id": NAVER_CLIENT_ID, "X-Naver-Client-Secret": NAVER_CLIENT_SECRET}
-    params = {"query": keyword, "display": display, "sort": sort}
+    params = {"query": keyword, "display": display, "sort": sort, "start": start}
     if cat: params["category"] = cat
     try: return requests.get("https://openapi.naver.com/v1/search/shop.json", headers=headers, params=params).json().get("items", [])
     except: return []
@@ -231,8 +231,16 @@ def clean_titles_with_ai(titles_by_brand):
             for attempt in range(3):
                 try:
                     res = ai_model.generate_content(prompt)
-                    for p in json.loads(res.text):
-                        cleaned_dict[p.get("original", "")] = p.get("clean_title", "").replace("[", "").replace("]", "").strip()
+                    parsed = json.loads(res.text)
+                    batch_set = set(batch)
+                    for p in parsed:
+                        original = p.get("original", "")
+                        clean_title = p.get("clean_title", "").replace("[", "").replace("]", "").strip()
+                        if original not in batch_set:
+                            continue
+                        if not clean_title or clean_title.isdigit():
+                            clean_title = original
+                        cleaned_dict[original] = clean_title
                     success = True
                     break
                 except Exception as e:
@@ -359,7 +367,8 @@ def run():
 
     for brand, clean_title in unique_items:
         search_query = f"{brand} {clean_title}"
-        items = search_naver(search_query, display=100, sort="sim") 
+        items = search_naver(search_query, display=100, sort="sim")
+        items = items + search_naver(search_query, display=100, sort="sim", start=101)  # expand to 200 results (2 pages) to catch listings ranked below top 100 
         
         for item in items:
             mall_name, link = item.get("mallName", ""), item.get("link", "")
