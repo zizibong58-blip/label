@@ -62,7 +62,8 @@ STORE_MAPPING = {
     "alico": ["알리코", "alico"], "lanic-u": ["라니쿠", "lanic-u"], "beaucla": ["보클레", "beaucla"], "pinkholicya": ["핑크홀릭", "pinkholicya"], 
     "neulpumdaa": ["늘품다", "neulpumdaa"], "mou9": ["모구", "mou9"], "lasibelle": ["라시벨", "lasibelle"], "carinowm": ["카리노", "carinowm"]
 }
-CATEGORIES = ["50000167", "50000190", "50000174"] 
+# ✅ FIX: CATEGORIES(카테고리 3개 제한) 제거됨 — 네이버 자체 분류에 없는 카테고리 상품이
+# 통째로 누락되는 원인이었음. 이제 1단계 검색은 카테고리 제한 없이 페이지만 늘려서 수행함.
 
 def load_list(filename):
     if not os.path.exists(filename): return []
@@ -286,10 +287,15 @@ def run():
 
     extended_store_ids = list(set(store_ids + ["samtandbyme"]))
 
+    # ✅ FIX: 예전엔 CATEGORIES(50000167/50000190/50000174) 3개 코드로만 검색을 좁혔는데,
+    # 네이버 자체 분류(예: "티셔츠")가 이 3개 안에 없으면 그 카테고리의 상품은
+    # 해당 스토어가 아무리 많이 팔아도 1단계에서 원천적으로 아예 검색조차 안 됐음
+    # (실제로 미엘 베이비나시 = "패션의류>여성의류>티셔츠"라서 통째로 누락된 게 확인됨).
+    # 카테고리로 좁히는 대신, 페이지(start)를 늘려서 카테고리 무관하게 최근 300개를 모두 훑는다.
     for sid in extended_store_ids:
         search_kw = STORE_MAPPING.get(sid, [sid])[0]
-        for cat in CATEGORIES:
-            items = search_naver(search_kw, cat=cat, display=100, sort="date")
+        for start in (1, 101, 201):
+            items = search_naver(search_kw, cat=None, display=100, sort="date", start=start)
             for item in items:
                 mall_name, link = item.get("mallName", ""), item.get("link", "")
                 if not is_target_store(mall_name, link, store_ids) == sid: continue
