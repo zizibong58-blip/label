@@ -52,7 +52,7 @@ IMAGE_PRIORITY = {
 }
 
 STORE_MAPPING = {
-    "ttoyuni": ["ttoyuni", "또유니"], "occupe": ["오큐페", "occupe"], "leidu": ["레이두", "leidu"], 
+    "ttoyuni": ["ttoyuni", "또유니", "떠유니"], "occupe": ["오큐페", "occupe"], "leidu": ["레이두", "leidu"], 
     "enough_": ["이너프", "enough", "enough_"], "nowadays_": ["나우어데이즈", "나우 어 데이즈", "nowadays", "nowadays_"],
     "staynoah": ["스테이노아", "staynoah"], "themellow": ["더멜로우", "themellow"],
     "bernadette1": ["버나뎃", "bernadette", "bernadette1"], "muniate": ["무니에트", "muniate"],
@@ -62,6 +62,11 @@ STORE_MAPPING = {
     "alico": ["알리코", "alico"], "lanic-u": ["라니쿠", "lanic-u"], "beaucla": ["보클레", "beaucla"], "pinkholicya": ["핑크홀릭", "pinkholicya"], 
     "neulpumdaa": ["늘품다", "neulpumdaa"], "mou9": ["모구", "mou9"], "lasibelle": ["라시벨", "lasibelle"], "carinowm": ["카리노", "carinowm"]
 }
+# ✅ NEW: 셀러가 상품명 끝에 대괄호 없이 그냥 붙이는 자체 홍보 태그(예: "...아이보리 떠유니")를
+# AI에게 넘기기 전에 원천 제거하기 위한 패턴. 안 지우면 AI가 이걸 상품 고유 식별어로
+# 착각해서 "떠유니 떠유니"처럼 상품명 자체가 스토어명으로 오염되는 사고가 남.
+_ALL_STORE_ALIASES = sorted({alias for aliases in STORE_MAPPING.values() for alias in aliases if len(alias) >= 2}, key=len, reverse=True)
+_STORE_ALIAS_PATTERN = re.compile("|".join(re.escape(a) for a in _ALL_STORE_ALIASES), re.IGNORECASE)
 # ✅ FIX: CATEGORIES(카테고리 3개 제한) 제거됨 — 네이버 자체 분류에 없는 카테고리 상품이
 # 통째로 누락되는 원인이었음. 이제 1단계 검색은 카테고리 제한 없이 페이지만 늘려서 수행함.
 
@@ -308,6 +313,11 @@ def run():
                 # ✅ FIX: 소매상이 앞에 붙이는 자체 태그는 항상 대괄호 안에 있음
                 # (예: "[MUNIATE/무니에트]") — 브랜드 매칭 전에 통째로 제거해서 애초에 후보에서 배제.
                 raw_title = re.sub(r"\[[^\]]*\]", "", raw_title).strip()
+                # ✅ NEW: 대괄호 없이 그냥 텍스트 끝에 붙는 스토어 자체 홍보 태그도 제거
+                # (예: "...프릴 아이보리 떠유니" 처럼 대괄호 없이 스토어명이 그냥 붙는 경우).
+                # 이걸 안 지우면 AI가 스토어명을 상품 고유 식별어로 착각해서
+                # "떠유니 떠유니"처럼 상품명 자체가 스토어명으로 오염됨.
+                raw_title = _STORE_ALIAS_PATTERN.sub("", raw_title).strip()
                 raw_title_lower = raw_title.replace(" ", "").lower()
                 # ✅ FIX: 대괄호 태그를 이미 제거했으므로, 남은 텍스트에서 여러 브랜드가 동시에
                 # 매칭되더라도 가장 먼저(앞에) 나오는 브랜드가 진짜 도매택이다.
@@ -360,9 +370,12 @@ def run():
         for raw_t in titles:
             clean_t = cleaned_map.get(raw_t, "")
             parts = clean_t.split()
-            if not parts: continue
+            # ✅ FIX: AI가 단어를 하나만 반환한 경우(카테고리를 못 뽑고 상품명만 준 경우) 투표 대상에서 제외.
+            # 예전엔 이럴 때 product_name 자기 자신을 카테고리로 셀프 투표해서, 그게 다수결로 이기면
+            # "히로 히로"처럼 같은 단어가 중복 출력되는 사고가 났음.
+            if len(parts) < 2: continue
             product_name = parts[0]
-            category = parts[-1] if len(parts) > 1 else parts[0]
+            category = parts[-1]
             key = (brand_b, product_name)
             category_votes.setdefault(key, {})
             category_votes[key][category] = category_votes[key].get(category, 0) + 1
@@ -386,8 +399,12 @@ def run():
             if key in no_merge_keys:
                 # 어드민이 이미 여러 카테고리로 나눠놓은 상품명 -> 강제 통합 없이 개별 판단 그대로 사용
                 final_clean_title = clean_t
-            else:
+            elif key in final_category:
                 final_clean_title = f"{product_name} {final_category[key]}"
+            else:
+                # ✅ FIX: 이 상품명키워드에 대해 카테고리 정보를 준 항목이 하나도 없으면(전부 한 단어 응답)
+                # product_name을 억지로 카테고리 자리에도 채우지 말고 AI 원본 응답(clean_t) 그대로 사용
+                final_clean_title = clean_t
             unique_items.add((brand_b, final_clean_title))
             raw_title_resolved[raw_t] = (brand_b, final_clean_title)
 
