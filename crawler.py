@@ -158,6 +158,10 @@ def clean_titles_with_ai(titles_by_brand):
     total_titles = sum(len(v) for v in titles_by_brand.values())
     print(f"\n🤖 제미나이 AI가 {len(titles_by_brand)}개 브랜드, 총 {total_titles}개의 상품명을 분석합니다...")
     cleaned_dict = {}
+    all_store_aliases = set()
+    for alias_list in STORE_MAPPING.values():
+        for alias in alias_list:
+            all_store_aliases.add(alias.replace(" ", "").lower())
     batch_size = 40
     # ✅ FIX: 브랜드를 섞지 않고 브랜드별로 묶어서 배치 처리.
     # 같은 브랜드 상품명을 여러 개 같이 보여줘야, 여러 상품에 반복 등장하는
@@ -240,6 +244,9 @@ def clean_titles_with_ai(titles_by_brand):
                             continue
                         if not clean_title or clean_title.isdigit():
                             clean_title = original
+                        first_word = clean_title.split()[0].replace(" ", "").lower() if clean_title.split() else ""
+                        if first_word in all_store_aliases:
+                            clean_title = original
                         cleaned_dict[original] = clean_title
                     success = True
                     break
@@ -293,7 +300,7 @@ def run():
                 # 매칭되더라도 가장 먼저(앞에) 나오는 브랜드가 진짜 도매택이다.
                 # ("코드/영문표기 + 진짜브랜드 + 상품명 + 카테고리" 순서가 일관된 패턴이라
                 # 뒤에 나오는 매칭은 다른 브랜드명과 우연히 겹치는 상품명/디테일어인 경우가 많음)
-                matched = [(raw_title.lower().find(b.lower()), b) for b, b_lower in zip(brands, brand_lower_list) if b_lower in raw_title_lower]
+                matched = [(raw_title_lower.find(b_lower), b) for b, b_lower in zip(brands, brand_lower_list) if b_lower in raw_title_lower]
                 if matched:
                     brand_pos, b = min(matched, key=lambda x: x[0])
                     trimmed_title = raw_title[brand_pos:] if brand_pos > 0 else raw_title
