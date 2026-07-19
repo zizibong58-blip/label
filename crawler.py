@@ -100,12 +100,19 @@ def get_blacklist():
 # 갈라지는 것을 막기 위해, 이미 예전 크롤링에서 특정 product_id에 배정된 적 있는
 # 링크 -> product_id 매핑을 가져온다. 이번 AI 결과가 다르게 나와도 이 매핑이 있으면
 # 무조건 기존 상품에 그대로 고정 배정한다 (스토어 상품번호=링크가 곧 정답이므로).
-def get_existing_link_mapping():
+def get_existing_links():
+    """
+    링크(product_url) -> DB에 저장된 마지막 store_link 정보 전체(product_id 포함).
+    ✅ FIX: 예전엔 product_id만 가져와서, 이번 크롤링 검색에서 재발견되지 않은 링크는
+    (특히 admin이 병합/분리로 확정해놓은 링크도) 그냥 통째로 유실됐음.
+    store_name/store_id/price/store_title/store_image까지 같이 가져와서,
+    검색으로 못 찾은 링크도 DB에 남아있던 값 그대로 복원할 수 있게 한다.
+    """
     try:
         all_rows, page_size, offset = [], 1000, 0
         while True:
             res = requests.get(
-                f"{SUPABASE_URL}/rest/v1/store_links?select=product_url,product_id&limit={page_size}&offset={offset}",
+                f"{SUPABASE_URL}/rest/v1/store_links?select=product_url,product_id,store_name,store_id,price,store_title,store_image&limit={page_size}&offset={offset}",
                 headers=HEADERS
             )
             if res.status_code != 200: break
@@ -113,7 +120,7 @@ def get_existing_link_mapping():
             all_rows.extend(batch)
             if len(batch) < page_size: break
             offset += page_size
-        return {row['product_url']: row['product_id'] for row in all_rows}
+        return {row['product_url']: row for row in all_rows}
     except: return {}
 
 def is_target_store(mall_name, link, store_ids):
@@ -270,13 +277,13 @@ def run():
     rename_rules = get_rename_rules()
     merge_rules = get_merge_rules()   # ✅ FIX
     blacklist = get_blacklist()       # ✅ FIX
-    existing_link_to_pid = get_existing_link_mapping()  # ✅ NEW: 링크별 기존 배정 상품 고정용
+    existing_links = get_existing_links()  # ✅ NEW: 링크별 기존 배정 상품+스토어 정보 고정/복원용
     print(f"🚀 LABEL V2 가동 (도매택 {len(brands)}개 / 소매상 {len(store_ids)}개 / 휴먼분리 {len(split_rules)}건 / 병합 {len(merge_rules)}건 / 블랙리스트 {len(blacklist)}건 적용)\n")
     
     brand_lower_list = [b.replace(" ", "").lower() for b in brands]
     titles_by_brand = {}
-    seen_raw_titles = set()
-    
+    raw_title_sources = {}  # ✅ NEW: raw_title(trimmed) -> 이 제목으로 발견된 모든 스토어의 실제 아이템 정보 리스트
+
     extended_store_ids = list(set(store_ids + ["samtandbyme"]))
 
     for sid in extended_store_ids:
@@ -304,9 +311,19 @@ def run():
                 if matched:
                     brand_pos, b = min(matched, key=lambda x: x[0])
                     trimmed_title = raw_title[brand_pos:] if brand_pos > 0 else raw_title
-                    if trimmed_title not in seen_raw_titles:
-                        seen_raw_titles.add(trimmed_title)
-                        titles_by_brand.setdefault(b, []).append(trimmed_title)
+
+                    titles_by_brand.setdefault(b, set()).add(trimmed_title)
+                    # ✅ NEW: 예전엔 seen_raw_titles로 "이미 나온 제목"이면 통째로 버려서,
+                    # 같은 제목을 쓰는 두 번째 스토어의 실제 링크/가격/썸네일이 아예 기록조차 안 됐음.
+                    # 이제 제목이 같아도 스토어별 실제 아이템 정보는 전부 보관한다.
+                    src_list = raw_title_sources.setdefault(trimmed_title, [])
+                    if clean_link not in {s["clean_link"] for s in src_list}:
+                        src_list.append({
+                            "mall_name": mall_name, "link": link, "clean_link": clean_link,
+                            "price": int(item.get("lprice", "0")), "image": item.get("image", ""),
+                            "naver_product_id": item.get("productId", ""),
+                            "store_title": raw_title
+                        })
         time.sleep(0.3)
 
     cleaned_map = clean_titles_with_ai(titles_by_brand) if titles_by_brand else {}
@@ -352,6 +369,7 @@ def run():
     grouped_products = {}
     unique_items = set()
 
+    raw_title_resolved = {}  # ✅ NEW: raw_title -> (brand, 최종 clean_title). 1단계 아이템을 재검색 없이 바로 그룹에 편입시키기 위한 역매핑.
     for brand_b, titles in titles_by_brand.items():
         for raw_t in titles:
             clean_t = cleaned_map.get(raw_t, "")
@@ -361,90 +379,141 @@ def run():
             key = (brand_b, product_name)
             if key in no_merge_keys:
                 # 어드민이 이미 여러 카테고리로 나눠놓은 상품명 -> 강제 통합 없이 개별 판단 그대로 사용
-                unique_items.add((brand_b, clean_t))
+                final_clean_title = clean_t
             else:
-                unique_items.add((brand_b, f"{product_name} {final_category[key]}"))
+                final_clean_title = f"{product_name} {final_category[key]}"
+            unique_items.add((brand_b, final_clean_title))
+            raw_title_resolved[raw_t] = (brand_b, final_clean_title)
 
     for correct_title in split_rules.values():
         if "|" in correct_title:
             b_name, c_title = correct_title.split("|", 1)
             unique_items.add((b_name.strip(), c_title.strip()))
 
-    assigned_links = set()  # ✅ NEW: 이번 크롤링에서 이미 어떤 상품군에 배정된 링크(URL) 추적 — 같은 리스팅이 여러 그룹에 중복 편입되는 것 방지
+    assigned_links = set()  # 이번 크롤링에서 이미 어떤 상품군에 배정된 링크(URL) 추적 — 같은 리스팅이 여러 그룹에 중복 편입되는 것 방지
 
+    def try_assign_item(brand, clean_title, mall_name, link, price, image, naver_product_id, store_title_text, validate_title=True):
+        clean_link = link.split("?")[0].strip()
+        if clean_link in blacklist: return
+        store_id = is_target_store(mall_name, link, store_ids)
+        if not store_id: return
+        if clean_link in assigned_links: return  # 이미 다른 (brand, clean_title)에서 배정된 링크면 건너뜀
+
+        forced_merge = merge_rules.get(clean_link)
+        if forced_merge and "|" in forced_merge:
+            dedup_key = forced_merge
+        else:
+            forced_title = split_rules.get(clean_link)
+            if forced_title:
+                forced_brand, forced_clean_title = forced_title.split("|", 1)
+                if brand != forced_brand.strip() or clean_title != forced_clean_title.strip(): return
+                dedup_key = forced_title
+            elif clean_link in existing_links:
+                # 이 링크는 예전 크롤링에서 이미 어떤 상품에 배정된 적이 있음. 이번 AI 정제 결과가
+                # 그때와 다르게 나왔어도 무시하고 기존 product_id를 그대로 사용.
+                dedup_key = existing_links[clean_link]['product_id']
+            else:
+                if validate_title:
+                    # ✅ 2차(광역 sim검색) 결과만 검증. 1차(스토어별 검색) 결과는 raw_title 자체에서
+                    # clean_title이 파생됐으므로 이 검증이 불필요 — 오히려 더 정확함.
+                    raw_title_nospace = store_title_text.replace(" ", "").lower()
+                    clean_words = clean_title.split()
+                    if not clean_words: return
+                    main_keyword = clean_words[0].lower()
+                    category_keyword = clean_words[-1].lower()
+                    brand_nospace = brand.replace(" ", "").lower()
+                    if (brand_nospace + main_keyword) not in raw_title_nospace: return
+                    if category_keyword not in raw_title_nospace: return
+                dedup_key = f"{brand}|{clean_title}"
+
+        if dedup_key not in grouped_products:
+            grouped_products[dedup_key] = {
+                "brand_name": dedup_key.split("|")[0], "title": dedup_key.split("|")[-1], "clean_title": dedup_key.split("|")[-1],
+                "image_url": image,
+                "product_id": dedup_key,  # 🔥 핵심: 네이버 ID 대신 불변의 '도매택|상품명'을 고유 ID로 콱 박아버립니다!
+                "crawled_at": datetime.now().isoformat(), "store_links": [],
+                "_best_prio": IMAGE_PRIORITY.get(store_id, 99)
+            }
+
+        existing_stores = [l['store_id'] for l in grouped_products[dedup_key]["store_links"]]
+        if store_id not in existing_stores:
+            grouped_products[dedup_key]["store_links"].append({
+                "store_name": mall_name, "store_id": store_id,
+                "price": price, "product_url": link,
+                "store_title": store_title_text,
+                "store_image": image,
+                "naver_product_id": naver_product_id  # ✅ FIX: 리뷰 조회용 진짜 네이버 상품ID 보관
+            })
+            new_prio = IMAGE_PRIORITY.get(store_id, 99)
+            if new_prio < grouped_products[dedup_key]["_best_prio"]:
+                grouped_products[dedup_key]["image_url"] = image
+                grouped_products[dedup_key]["_best_prio"] = new_prio
+
+        assigned_links.add(clean_link)
+
+    # ── 1차: 1단계(스토어별 직접 검색)에서 이미 is_target_store로 검증된 아이템을
+    # 재검색 없이 바로 편입. 예전엔 이 정보를 버리고 2단계 sim검색 재발견에만 의존했는데,
+    # 인기 상품일수록 다른 판매처에 밀려 sim 200위 안에 못 들어서 멀쩡히 취급 중인
+    # 타겟 스토어가 크롤링마다 랜덤하게 누락되는 원인이었음.
+    phase1_added = 0
+    for raw_t, sources in raw_title_sources.items():
+        resolved = raw_title_resolved.get(raw_t)
+        if not resolved: continue
+        brand, clean_title = resolved
+        for src in sources:
+            before = len(assigned_links)
+            try_assign_item(brand, clean_title, src["mall_name"], src["link"], src["price"], src["image"],
+                             src["naver_product_id"], src["store_title"], validate_title=False)
+            if len(assigned_links) > before: phase1_added += 1
+    print(f"  📌 1차(스토어별 직접 검색)에서 바로 편입된 링크: {phase1_added}개")
+
+    # ── 2차: 브랜드+상품명 광역 검색으로, 1차가 놓친(예: 카테고리당 100개 제한 밖) 추가 스토어 보충 ──
     for brand, clean_title in unique_items:
         search_query = f"{brand} {clean_title}"
         items = search_naver(search_query, display=100, sort="sim")
-        items = items + search_naver(search_query, display=100, sort="sim", start=101)  # expand to 200 results (2 pages) to catch listings ranked below top 100 
-        
+        items = items + search_naver(search_query, display=100, sort="sim", start=101)  # expand to 200 results (2 pages) to catch listings ranked below top 100
+
         for item in items:
             mall_name, link = item.get("mallName", ""), item.get("link", "")
-            clean_link = link.split("?")[0].strip()
-            if clean_link in blacklist: continue  # ✅ FIX: 2단계 탐색에서도 삭제된 링크 제외
-            store_id = is_target_store(mall_name, link, store_ids)
-            if not store_id: continue
+            try_assign_item(
+                brand, clean_title, mall_name, link,
+                int(item.get("lprice", "0")), item.get("image", ""), item.get("productId", ""),
+                re.sub(r"<[^>]+>", "", item.get("title", "")), validate_title=True
+            )
 
-            # ✅ NEW: 이미 다른 (brand, clean_title) 검색에서 어떤 상품군에 배정된 링크면 건너뜀.
-            # AI가 같은 상품을 여러 이름으로 정제해도, 실제 링크는 딱 한 곳에만 속하게 됨.
-            if clean_link in assigned_links: continue
-            
-            # ✅ FIX: 병합 규칙이 있으면, 이 링크가 어떤 검색어에서 나왔든 상관없이
-            # 지정된 대상 상품(target_clean_title)으로 강제 편입시킨다.
-            forced_merge = merge_rules.get(clean_link)
-            if forced_merge and "|" in forced_merge:
-                dedup_key = forced_merge
-            else:
-                forced_title = split_rules.get(clean_link)
-                if forced_title:
-                    forced_brand, forced_clean_title = forced_title.split("|", 1)
-                    if brand != forced_brand.strip() or clean_title != forced_clean_title.strip(): continue 
-                    dedup_key = forced_title 
-                elif clean_link in existing_link_to_pid:
-                    # ✅ NEW: 이 링크는 예전 크롤링에서 이미 어떤 상품에 배정된 적이 있음.
-                    # 이번 AI 정제 결과(clean_title)가 그때와 다르게 나왔어도 무시하고
-                    # 기존 product_id를 그대로 사용 — 같은 리스팅이 실행마다 다른 이름으로
-                    # 갈라져서 중복 그룹이 생기는 걸 원천 차단.
-                    dedup_key = existing_link_to_pid[clean_link]
-                else:
-                    raw_title_nospace = re.sub(r"<[^>]+>", "", item.get("title", "")).replace(" ", "").lower()
-                    clean_words = clean_title.split()
-                    if not clean_words: continue
-                    
-                    main_keyword = clean_words[0].lower() 
-                    category_keyword = clean_words[-1].lower() 
-                    brand_nospace = brand.replace(" ", "").lower() 
-                    
-                    if (brand_nospace + main_keyword) not in raw_title_nospace: continue 
-                    if category_keyword not in raw_title_nospace: continue 
-                    dedup_key = f"{brand}|{clean_title}"
-            
-            if dedup_key not in grouped_products:
-                grouped_products[dedup_key] = {
-                    # ✅ FIX: brand_name을 loop 변수(brand)가 아니라 dedup_key에서 파생시킴.
-                    # 병합(forced_merge)된 경우 대상 상품의 브랜드와 현재 검색 loop의 brand가 다를 수 있기 때문.
-                    "brand_name": dedup_key.split("|")[0], "title": dedup_key.split("|")[-1], "clean_title": dedup_key.split("|")[-1], 
-                    "image_url": item.get("image", ""), 
-                    "product_id": dedup_key, # 🔥 핵심: 네이버 ID 대신 불변의 '도매택|상품명'을 고유 ID로 콱 박아버립니다!
-                    "crawled_at": datetime.now().isoformat(), "store_links": [],
-                    "_best_prio": IMAGE_PRIORITY.get(store_id, 99)
-                }
-            
-            existing_stores = [l['store_id'] for l in grouped_products[dedup_key]["store_links"]]
-            if store_id not in existing_stores:
-                grouped_products[dedup_key]["store_links"].append({
-                    "store_name": mall_name, "store_id": store_id,
-                    "price": int(item.get("lprice", "0")), "product_url": link,
-                    "store_title": re.sub(r"<[^>]+>", "", item.get("title", "")),
-                    "store_image": item.get("image", ""),
-                    "naver_product_id": item.get("productId", "")  # ✅ FIX: 리뷰 조회용 진짜 네이버 상품ID 보관
-                })
-                new_prio = IMAGE_PRIORITY.get(store_id, 99)
-                if new_prio < grouped_products[dedup_key]["_best_prio"]:
-                    grouped_products[dedup_key]["image_url"] = item.get("image", "")
-                    grouped_products[dedup_key]["_best_prio"] = new_prio
+    # ✅ NEW: admin이 병합(merge_rules)/분리(split_rules)로 확정한 링크는 이번 크롤링의
+    # Naver 재검색에서 우연히 재발견되지 못해도(랭킹 변동, is_target_store 실패 등) 사라지면 안 됨.
+    # 검색 결과 재등장 여부에 의존하지 않고, DB에 남아있던 마지막 값으로 그대로 복원한다.
+    # (단, 이 링크가 DB에서도 이미 지워진 상태였다면 복원할 데이터가 없어 못 살림 —
+    #  그 경우엔 이번 패치 이후 다시 발견될 때 admin에서 한 번 더 병합해줘야 함)
+    forced_targets = {}
+    for url, target in merge_rules.items():
+        if "|" in target: forced_targets[url] = target.strip()
+    for url, target in split_rules.items():
+        if "|" in target: forced_targets.setdefault(url, target.strip())
 
-            # ✅ NEW: 이 링크는 이제 dedup_key에 확정 배정됨 — 이후 다른 검색어 반복에서 재사용 안 함
-            assigned_links.add(clean_link)
+    restored = 0
+    for clean_url, target in forced_targets.items():
+        if clean_url in assigned_links: continue      # 이번에 정상적으로 재발견됨 -> 스킵
+        if clean_url in blacklist: continue            # 이후 admin이 삭제 처리했으면 복원 안 함
+        if target not in grouped_products: continue    # 합쳐질 대상 상품 자체가 이번에 아예 안 잡혔으면 스킵(더 큰 별개 문제)
+        cached = existing_links.get(clean_url)
+        if not cached or not cached.get('store_id'): continue  # DB에도 예전 기록이 없으면 복원 불가
+
+        existing_stores = [l['store_id'] for l in grouped_products[target]["store_links"]]
+        if cached['store_id'] not in existing_stores:
+            grouped_products[target]["store_links"].append({
+                "store_name": cached.get('store_name', ''), "store_id": cached['store_id'],
+                "price": cached.get('price', 0), "product_url": clean_url,
+                "store_title": cached.get('store_title', ''),
+                "store_image": cached.get('store_image', ''),
+                "naver_product_id": ""
+            })
+            restored += 1
+        assigned_links.add(clean_url)
+
+    if restored:
+        print(f"  🔗 이번 검색에서 재발견 안 됐지만 병합/분리 확정 기록으로 복원된 링크: {restored}개")
 
     final_data = []
     print("\n📸 썸네일 다운 및 리뷰 수집 중...")
