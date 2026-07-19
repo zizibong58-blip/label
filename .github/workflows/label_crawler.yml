@@ -6,7 +6,7 @@ on:
 jobs:
   crawl-and-upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 330  # ✅ FIX: 카테고리 제한 해제 이후 크롤링 범위가 훨씬 넓어져서(2h 넘게 걸림) 120분으론 업로드 전에 강제 종료됨. GitHub 호스팅 러너 자체 상한이 360분이라 여유를 두고 330분으로 설정.
     steps:
       - name: 저장소 체크아웃
         uses: actions/checkout@v4

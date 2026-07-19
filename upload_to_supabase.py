@@ -100,5 +100,100 @@ def upload():
 
     print(f"\n🎉 업로드 완료! 성공 {success}개 / 실패 {fail}개 (click_count 보존됨)")
 
+    dedupe_existing_duplicates()
+
+
+def fetch_all(table, select, extra_params=None):
+    """페이지네이션 처리하며 테이블 전체 조회"""
+    all_rows, page_size, offset = [], 1000, 0
+    while True:
+        params = {"select": select, "limit": page_size, "offset": offset}
+        if extra_params:
+            params.update(extra_params)
+        res = requests.get(f"{SUPABASE_URL}/rest/v1/{table}", headers=DELETE_HEADERS, params=params)
+        if res.status_code != 200:
+            print(f"  ⚠️ {table} 조회 실패: {res.status_code} {res.text[:200]}")
+            break
+        batch = res.json()
+        all_rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+    return all_rows
+
+
+def dedupe_existing_duplicates():
+    """
+    ✅ NEW: 업로드 끝날 때마다 자동 실행되는 사후 정리.
+    같은 product_url(스토어 링크)이 서로 다른 product_id 밑에 동시에 존재하면
+    (AI가 크롤링마다 상품명을 조금씩 다르게 뽑아서 예전에 갈라진 경우 등),
+    그건 100% 같은 상품이 갈라진 것이므로 자동으로 하나로 합친다.
+    브랜드+최저가 추측(어드민 병합 추천)과 달리 "URL 공유"는 반박 불가능한 사실이라 안전하게 자동 처리 가능.
+    승자 선정: store_links 개수가 더 많은 쪽 -> 동률이면 crawled_at이 더 최근인 쪽.
+    """
+    print("\n🧹 URL 공유 기반 중복 상품군 자동 정리 시작...")
+    store_links = fetch_all("store_links", "id,product_id,product_url")
+    products = fetch_all("products", "id,product_id,brand_name,title,crawled_at")
+    products_by_pid = {p["product_id"]: p for p in products}
+
+    parent = {}
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    url_to_pids = {}
+    for row in store_links:
+        url_to_pids.setdefault(row["product_url"], set()).add(row["product_id"])
+    for pids in url_to_pids.values():
+        pids = list(pids)
+        for i in range(1, len(pids)):
+            union(pids[0], pids[i])
+
+    clusters = {}
+    for pid in parent:
+        clusters.setdefault(find(pid), set()).add(pid)
+    clusters = [c for c in clusters.values() if len(c) > 1]
+
+    if not clusters:
+        print("  ✅ 중복 없음")
+        return
+
+    links_by_pid = {}
+    for row in store_links:
+        links_by_pid.setdefault(row["product_id"], []).append(row)
+
+    for cluster in clusters:
+        cluster = list(cluster)
+        cluster.sort(key=lambda pid: (len(links_by_pid.get(pid, [])), products_by_pid.get(pid, {}).get("crawled_at", "")), reverse=True)
+        winner, losers = cluster[0], cluster[1:]
+        print(f"  🔗 {winner}  <-  {', '.join(losers)}")
+
+        for loser in losers:
+            fav_rows = requests.get(
+                f"{SUPABASE_URL}/rest/v1/favorites", headers=DELETE_HEADERS,
+                params={"select": "id", "product_id": f"eq.{loser}"}
+            ).json()
+            for row in fav_rows:
+                r = requests.patch(
+                    f"{SUPABASE_URL}/rest/v1/favorites", headers=DELETE_HEADERS,
+                    params={"id": f"eq.{row['id']}"}, json={"product_id": winner}
+                )
+                if r.status_code not in (200, 204):
+                    requests.delete(f"{SUPABASE_URL}/rest/v1/favorites", headers=DELETE_HEADERS, params={"id": f"eq.{row['id']}"})
+            requests.patch(
+                f"{SUPABASE_URL}/rest/v1/store_links", headers=DELETE_HEADERS,
+                params={"product_id": f"eq.{loser}"}, json={"product_id": winner}
+            )
+            requests.delete(f"{SUPABASE_URL}/rest/v1/products", headers=DELETE_HEADERS, params={"product_id": f"eq.{loser}"})
+
+    print(f"  🎉 {len(clusters)}개 중복 클러스터 자동 병합 완료")
+
 if __name__ == "__main__":
     upload()
