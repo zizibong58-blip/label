@@ -1,6 +1,7 @@
 import os, re, json, time, requests
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor  # ✅ NEW: 리뷰수집/2차검색 병렬화용 (둘 다 네트워크 대기가 대부분인 독립 작업)
 import google.generativeai as genai
 from dotenv import load_dotenv
 
@@ -491,11 +492,21 @@ def run():
     print(f"  📌 1차(스토어별 직접 검색)에서 바로 편입된 링크: {phase1_added}개")
 
     # ── 2차: 브랜드+상품명 광역 검색으로, 1차가 놓친(예: 카테고리당 100개 제한 밖) 추가 스토어 보충 ──
-    for brand, clean_title in unique_items:
+    # ✅ NEW: 검색(네트워크 I/O)만 병렬로 먼저 다 가져오고, try_assign_item(공유 상태 변경)은
+    # 기존처럼 메인 스레드에서 순차 처리해서 안전하게 유지. unique_items가 1500개 넘어가면서
+    # 순차로 하나씩 검색하던 게(개당 2콜) 크롤링 시간의 큰 부분을 차지했던 걸 여기서 줄임.
+    def _fetch_phase2(bc):
+        brand, clean_title = bc
         search_query = f"{brand} {clean_title}"
         items = search_naver(search_query, display=100, sort="sim")
-        items = items + search_naver(search_query, display=100, sort="sim", start=101)  # expand to 200 results (2 pages) to catch listings ranked below top 100
+        items += search_naver(search_query, display=100, sort="sim", start=101)  # expand to 200 results (2 pages) to catch listings ranked below top 100
+        return (brand, clean_title, items)
 
+    unique_items_list = list(unique_items)
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        phase2_results = list(executor.map(_fetch_phase2, unique_items_list))
+
+    for brand, clean_title, items in phase2_results:
         for item in items:
             mall_name, link = item.get("mallName", ""), item.get("link", "")
             try_assign_item(
@@ -540,11 +551,14 @@ def run():
 
     final_data = []
     print("\n📸 썸네일 다운 및 리뷰 수집 중...")
+
+    # 사전 처리(빠른 부분: 이름변경 적용, 썸네일, 리뷰용 진짜 네이버 productId 결정) — 그대로 순차
+    prep_items = []
     for dedup_key, p in grouped_products.items():
         if dedup_key in rename_rules:
             p["title"] = rename_rules[dedup_key].split("|")[-1]
             p["clean_title"] = p["title"]
-            
+
         # ✅ NEW: 클라우드 러너(SKIP_LOCAL_IMAGE_DOWNLOAD=true)에서는 다운로드 생략, 로컬에서는 기존대로 동작
         p["local_image"] = None if SKIP_LOCAL_IMAGE_DOWNLOAD else download_image(p["image_url"], p["product_id"])
 
@@ -557,9 +571,17 @@ def run():
                 if l.get("naver_product_id"):
                     review_pid = l["naver_product_id"]
                     break
-        p["reviews"] = get_reviews(review_pid)
 
         del p["_best_prio"]
+        prep_items.append((p, review_pid))
+
+    # ✅ NEW: 리뷰 수집(네트워크 I/O)만 병렬로 — 상품끼리 서로 독립적이라 동시에 여러 개 쏴도 안전함.
+    # 순차로 하나씩 하면 1500개 기준 15~25분씩 걸리던 게 크롤링 전체 시간의 큰 부분을 차지했음.
+    with ThreadPoolExecutor(max_workers=20) as executor:
+        review_results = list(executor.map(lambda item: get_reviews(item[1]), prep_items))
+
+    for (p, _), reviews in zip(prep_items, review_results):
+        p["reviews"] = reviews
         final_data.append(p)
 
     OUTPUT_FILE.write_text(json.dumps(final_data, ensure_ascii=False, indent=2), encoding="utf-8")
