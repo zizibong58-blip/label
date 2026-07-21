@@ -35,7 +35,10 @@ ai_model = genai.GenerativeModel('gemini-2.5-flash', generation_config={"respons
 # 병렬로 더 쏘는 건 도움 안 됨 — 이 한도는 프로젝트 단위라 동시에 여러 개 쏴도 총량은 그대로 막힘.
 # 대신 호출 간격을 한도 안쪽으로 정확히 맞춰서, 애초에 실패/재시도 자체가 안 나게 만드는 게 핵심.
 _last_gemini_call = [0.0]
-_GEMINI_MIN_INTERVAL = 6.5  # 분당 10회 한도 대비 여유를 둔 안전 간격(분당 약 9.2회)
+# ✅ 유료 티어 전제: 무료 티어(분당 10회) 제약이 없으므로 간격을 0.5초로 단축.
+# 유료는 분당 1000~2000회까지 허용되어 rate limit에 안 걸림. 정제 시간 14분 -> 1~2분.
+# (0으로 하지 않는 건 서버에 대한 최소 예의 + 순간 폭주 방지용)
+_GEMINI_MIN_INTERVAL = 0.5
 
 def _gemini_call(prompt):
     elapsed = time.time() - _last_gemini_call[0]
@@ -197,7 +200,7 @@ def clean_titles_with_ai(titles_by_brand):
     for alias_list in STORE_MAPPING.values():
         for alias in alias_list:
             all_store_aliases.add(alias.replace(" ", "").lower())
-    batch_size = 40
+    batch_size = 15  # ✅ FIX: 40 -> 15. 배치 40개는 Gemini가 한 번에 처리하기엔 커서 504(응답시간 초과)가 반복 발생. 15로 줄이면 배치당 처리량이 작아져 504가 거의 안 남.
     # ✅ FIX: 브랜드를 섞지 않고 브랜드별로 묶어서 배치 처리.
     # 같은 브랜드 상품명을 여러 개 같이 보여줘야, 여러 상품에 반복 등장하는
     # 컬렉션/라인명(필러)과 그 상품에만 있는 진짜 고유 식별어를 AI가 구분할 수 있음.
@@ -267,14 +270,17 @@ def clean_titles_with_ai(titles_by_brand):
 입력: {json.dumps(batch, ensure_ascii=False)}
 출력: [ {{"original": "원본", "clean_title": "정답"}} ]"""
             success = False
-            for attempt in range(3):
+            for attempt in range(3):  # 배치를 15로 줄여 504가 거의 안 나므로 3회면 충분(일시적 오류 대비용)
                 try:
                     res = _gemini_call(prompt)
                     parsed = json.loads(res.text)
                     batch_set = set(batch)
                     for p in parsed:
                         original = p.get("original", "")
-                        clean_title = p.get("clean_title", "").replace("[", "").replace("]", "").strip()
+                        # ✅ FIX: Gemini가 clean_title을 null로 반환하면 .replace()에서 'NoneType' 에러로
+                        # 배치 전체가 실패했음(리터/리플랫 케이스). None이면 빈 문자열로 방어.
+                        raw_clean = p.get("clean_title") or ""
+                        clean_title = raw_clean.replace("[", "").replace("]", "").strip()
                         if original not in batch_set:
                             continue
                         if not clean_title or clean_title.isdigit():
@@ -288,7 +294,7 @@ def clean_titles_with_ai(titles_by_brand):
                 except Exception as e:
                     if attempt < 2:
                         print(f"  ⚠️ [{brand}] 배치 실패({e}), 재시도 {attempt+1}/2...", flush=True)
-                        time.sleep(5 * (attempt + 1))
+                        time.sleep(3 * (attempt + 1))
             if not success:
                 print(f"  ❌ [{brand}] 3회 재시도 실패 — 이 배치는 원본 제목이 그대로 저장됩니다.", flush=True)
                 for t in batch: cleaned_dict[t] = t
