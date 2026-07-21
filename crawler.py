@@ -28,6 +28,22 @@ SKIP_LOCAL_IMAGE_DOWNLOAD = os.environ.get("SKIP_LOCAL_IMAGE_DOWNLOAD", "false")
 
 genai.configure(api_key=GEMINI_API_KEY)
 ai_model = genai.GenerativeModel('gemini-2.5-flash', generation_config={"response_mime_type": "application/json", "temperature": 0})
+
+# ✅ NEW: gemini-2.5-flash 무료 티어는 분당 약 10회(RPM) 제한. 기존엔 3초 간격(분당 20회)으로
+# 한도를 2배 넘겨서, 429(RESOURCE_EXHAUSTED)로 실패 → 재시도(5초/10초 대기)가 반복되며
+# 시간이 눈덩이처럼 불어나는 원인이었음(실제로 크롤링 1회에 1시간 넘게 걸림).
+# 병렬로 더 쏘는 건 도움 안 됨 — 이 한도는 프로젝트 단위라 동시에 여러 개 쏴도 총량은 그대로 막힘.
+# 대신 호출 간격을 한도 안쪽으로 정확히 맞춰서, 애초에 실패/재시도 자체가 안 나게 만드는 게 핵심.
+_last_gemini_call = [0.0]
+_GEMINI_MIN_INTERVAL = 6.5  # 분당 10회 한도 대비 여유를 둔 안전 간격(분당 약 9.2회)
+
+def _gemini_call(prompt):
+    elapsed = time.time() - _last_gemini_call[0]
+    if elapsed < _GEMINI_MIN_INTERVAL:
+        time.sleep(_GEMINI_MIN_INTERVAL - elapsed)
+    _last_gemini_call[0] = time.time()
+    return ai_model.generate_content(prompt)
+
 # ✅ FIX: Supabase가 신규 키 체계(sb_secret_...)를 도입 — 이건 JWT가 아니라서
 # Authorization: Bearer 헤더에 넣으면 거부됨. apikey 헤더에만 넣어야 함.
 # 예전 JWT 기반 service_role 키(eyJ...)는 계속 Authorization 헤더도 필요해서 키 형식으로 자동 분기.
@@ -248,7 +264,7 @@ def clean_titles_with_ai(titles_by_brand):
             success = False
             for attempt in range(3):
                 try:
-                    res = ai_model.generate_content(prompt)
+                    res = _gemini_call(prompt)
                     parsed = json.loads(res.text)
                     batch_set = set(batch)
                     for p in parsed:
@@ -272,7 +288,6 @@ def clean_titles_with_ai(titles_by_brand):
                 print(f"  ❌ [{brand}] 3회 재시도 실패 — 이 배치는 원본 제목이 그대로 저장됩니다.")
                 for t in batch: cleaned_dict[t] = t
             print(f"  [{brand}] {min(i+batch_size, len(unique_titles))}/{len(unique_titles)} 분석 완료...")
-            time.sleep(3)
     return cleaned_dict
 
 def run():
@@ -389,23 +404,109 @@ def run():
     grouped_products = {}
     unique_items = set()
 
-    raw_title_resolved = {}  # ✅ NEW: raw_title -> (brand, 최종 clean_title). 1단계 아이템을 재검색 없이 바로 그룹에 편입시키기 위한 역매핑.
+    # ✅ NEW ─── 정제 검증 게이트 ───────────────────────────────────────────
+    # AI 정제(clean_title)는 확률적이라 상품마다 들쭉날쭉함. 이게 방치되면
+    # 같은 상품이 여러 그룹으로 쪼개지거나("팝콘 블라우스" vs "팝콘콩콩블라우스"),
+    # 스타일명이 실종되어 카테고리끼리 뭉치는("블라우스 블라우스", "가디건 가디건") 등
+    # 대부분의 오분류가 발생함. 그룹키로 확정하기 전에 여기서 기계적으로 교정한다.
+    CATEGORY_WORDS = {"나시","블라우스","셔츠","니트","가디건","원피스","팬츠","스커트","자켓","티셔츠"}
+
+    def resolve_style_and_category(brand_b, clean_t, raw_t):
+        """(product_name, category, is_valid) 반환. is_valid=False면 스타일명을 못 뽑은 것."""
+        parts = clean_t.split()
+        # 1) 카테고리 단어를 뒤/앞 어디에 있든 찾아냄
+        cat = None
+        for w in parts:
+            if w in CATEGORY_WORDS:
+                cat = w
+                break
+        # 2) 스타일명 후보 = 카테고리 단어가 아니고, 숫자만도 아닌 첫 단어
+        style = None
+        for w in parts:
+            if w in CATEGORY_WORDS: continue
+            if w.isdigit(): continue          # "84308381025" 같은 순수 숫자 스타일명 배제 (문제 3)
+            if len(w) < 1: continue
+            style = w
+            break
+        # 3) 다수결 카테고리로 보정 (같은 스타일명이 다른 곳에선 카테고리를 제대로 뽑았을 수 있음)
+        if style:
+            key = (brand_b, style)
+            if key in final_category:
+                cat = final_category[key]
+        # 4) 카테고리도 못 찾았으면 원본 제목에서 직접 스캔
+        if not cat:
+            raw_ns = raw_t.replace(" ", "")
+            for cw in CATEGORY_WORDS:
+                if cw in raw_ns:
+                    cat = cw
+                    break
+        # 5) 스타일명이 없으면(=카테고리 단어밖에 안 남음) 유효하지 않음 → 병합 후보로만
+        if not style:
+            return (None, cat, False)
+        if not cat:
+            cat = style   # 최후: 카테고리 못 찾으면 그냥 스타일명만 (드묾)
+        return (style, cat, True)
+
+    # ✅ NEW: AI가 스타일명을 놓쳤을 때 원본 제목에서 직접 건져내는 폴백.
+    _FILLER_WORDS = {
+        "여름","봄","가을","겨울","썸머","당일","신상","재진행","무료배송","당일출고","sale","하객",
+        "린넨","코튼","텐셀","울","쉬폰","새틴","골지","레이온","니트","시스루","레이스","데일리",
+        "오버핏","루즈핏","크롭","슬림","슬리브리스","반팔","긴팔","오프숄더","버튼","스트라이프",
+        "밴딩","셔링","퍼프","투웨이","스트링","폼폼","캡소매","여성","미니","숏","롱","2col","3col",
+        "col","bl","nt","pt","sk","op","여성의류","오늘출발"
+    }
+    _brand_alias_ns = {}  # 브랜드 -> 그 브랜드의 한/영 표기 없앨 집합
+    for _b in brands:
+        _brand_alias_ns.setdefault(_b, {_b.replace(" ", "").lower()})
+
+    def _salvage_style_from_raw(brand_b, raw_t, cat):
+        cleaned = re.sub(r"\[[^\]]*\]", " ", raw_t)          # 대괄호 태그 제거
+        cleaned = re.sub(r"\([^)]*\)", " ", cleaned)          # 소괄호 옵션 제거
+        cleaned = _STORE_ALIAS_PATTERN.sub(" ", cleaned)      # 스토어 자체 태그 제거
+        cleaned = re.sub(r"[^0-9A-Za-z가-힣\s]", " ", cleaned)
+        brand_ns = brand_b.replace(" ", "").lower()
+        for w in cleaned.split():
+            wl = w.lower()
+            wns = wl.replace(" ", "")
+            if wns == brand_ns: continue                      # 브랜드명
+            if brand_ns and (wns in brand_ns or brand_ns in wns): continue
+            if w in CATEGORY_WORDS: continue                  # 카테고리 단어
+            if wl in _FILLER_WORDS: continue                  # 소재/시즌/디테일 불용어
+            if w.isdigit(): continue                          # 숫자
+            if len(w) <= 1: continue
+            if len(w) <= 3 and re.fullmatch(r"[a-z]+", wl): continue  # ss/fw/pyt 같은 영문 약어
+            return w                                          # 남은 첫 의미 단어 = 스타일명
+        return None
+
+    raw_title_resolved = {}  # raw_title -> (brand, 최종 clean_title). 1단계 아이템을 재검색 없이 바로 그룹에 편입시키기 위한 역매핑.
     for brand_b, titles in titles_by_brand.items():
         for raw_t in titles:
             clean_t = cleaned_map.get(raw_t, "")
+            if not clean_t.split(): continue
             parts = clean_t.split()
-            if not parts: continue
             product_name = parts[0]
             key = (brand_b, product_name)
+
             if key in no_merge_keys:
                 # 어드민이 이미 여러 카테고리로 나눠놓은 상품명 -> 강제 통합 없이 개별 판단 그대로 사용
                 final_clean_title = clean_t
-            elif key in final_category:
-                final_clean_title = f"{product_name} {final_category[key]}"
             else:
-                # ✅ FIX: 이 상품명키워드에 대해 카테고리 정보를 준 항목이 하나도 없으면(전부 한 단어 응답)
-                # product_name을 억지로 카테고리 자리에도 채우지 말고 AI 원본 응답(clean_t) 그대로 사용
-                final_clean_title = clean_t
+                style, cat, is_valid = resolve_style_and_category(brand_b, clean_t, raw_t)
+                if not is_valid:
+                    # ✅ AI가 스타일명을 못 뽑음("블라우스 블라우스" 등). 원본 제목에서 직접 건져냄:
+                    #    브랜드명/스토어명/카테고리단어/숫자/불용어를 다 지우고 남는 첫 의미 단어를 스타일명으로.
+                    salvaged = _salvage_style_from_raw(brand_b, raw_t, cat)
+                    if salvaged:
+                        style, is_valid = salvaged, True
+                if is_valid:
+                    # 스타일명+카테고리 정상 -> 항상 "스타일명 카테고리" 순서로 표준화
+                    # (순서 뒤집힘/중복/숫자 스타일명 문제 여기서 전부 교정됨)
+                    final_clean_title = f"{style} {cat}"
+                else:
+                    # 최후: 원본 제목에서 카테고리만 확정된 채 스타일명을 끝내 못 건짐.
+                    # 카테고리로 뭉뚱그리지 않도록 원본 제목 일부로 고유 격리(서로 다른 상품이
+                    # 합쳐지는 것 방지) — 사용자 노출 title은 아래 grouped_products에서 정리됨.
+                    final_clean_title = f"{cat or '기타'} {raw_t[:14]}".strip()
             unique_items.add((brand_b, final_clean_title))
             raw_title_resolved[raw_t] = (brand_b, final_clean_title)
 
