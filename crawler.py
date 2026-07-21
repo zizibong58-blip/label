@@ -69,21 +69,23 @@ IMAGE_DIR.mkdir(exist_ok=True)
 IMAGE_PRIORITY = {
     "samtandbyme": 1, "grove": 2, "muniate": 3, "leidu": 4, "staynoah": 5, 
     "bernadette1": 6, "nunedestore": 7, "enough_": 8, "alico": 9, "lanic-u": 10, 
-    "beaucla": 11, "pinkholicya": 12, "neulpumdaa": 13, "mou9": 14, "lasibelle": 15, 
+    "beaucla": 11, "neulpumdaa": 13, "mou9": 14, "lasibelle": 15, 
     "carinowm": 16, "ttoyuni": 17, "occupe": 18, "nowadays_": 19, "themellow": 20, 
-    "bei-an": 21, "sundaymorningmaket": 22, "sweet_i": 23, "lunadeel": 24, "butterpezl": 25
+    "bei-an": 21, "sweet_i": 23, "lunadeel": 24, "butterpezl": 25
 }
 
 STORE_MAPPING = {
-    "ttoyuni": ["ttoyuni", "또유니", "떠유니"], "occupe": ["오큐페", "occupe"], "leidu": ["레이두", "leidu"], 
-    "enough_": ["이너프", "enough", "enough_"], "nowadays_": ["나우어데이즈", "나우 어 데이즈", "nowadays", "nowadays_"],
+    # ✅ 각 스토어의 실제 네이버 표시명을 사용자가 직접 확인해서 확정 (2026-07).
+    # 각 스토어당 [정확한 표시명, store_id] — 표시명은 한글 부분매칭, store_id는 링크/영문 완전일치용.
+    "ttoyuni": ["떠유니", "ttoyuni"], "occupe": ["오큐페", "occupe"], "leidu": ["레이두", "leidu"],
+    "enough_": ["이노프", "enough_"], "nowadays_": ["나우 어 데이즈", "nowadays_"],
     "staynoah": ["스테이노아", "staynoah"], "themellow": ["더멜로우", "themellow"],
-    "bernadette1": ["버나뎃", "bernadette", "bernadette1"], "muniate": ["무니에트", "muniate"],
-    "bei-an": ["바이안", "bei-an"], "sundaymorningmaket": ["선데이모닝마켓", "sundaymorningmaket", "선데이모닝"],
-    "sweet_i": ["스윗아이", "스윗 아이", "sweet_i"], "lunadeel": ["루나드엘", "lunadeel"], "butterpezl": ["버터프레즐", "butterpezl"], 
-    "nunedestore": ["누네드", "nunedestore", "누네드스토어"], "samtandbyme": ["그로브", "grove", "grove_store", "샘트앤바이미", "samtandbyme"], 
-    "alico": ["알리코", "alico"], "lanic-u": ["라니쿠", "lanic-u"], "beaucla": ["보클레", "beaucla"], "pinkholicya": ["핑크홀릭", "pinkholicya"], 
-    "neulpumdaa": ["늘품다", "neulpumdaa"], "mou9": ["모구", "mou9"], "lasibelle": ["라시벨", "lasibelle"], "carinowm": ["카리노", "carinowm"]
+    "bernadette1": ["버나뎃", "bernadette1"], "muniate": ["무니에트", "muniate"],
+    "bei-an": ["바이안", "bei-an"],
+    "sweet_i": ["스윗 아이", "sweet_i"], "lunadeel": ["루나드엘", "lunadeel"], "butterpezl": ["버터프레즐마켓", "butterpezl"],
+    "nunedestore": ["누네드", "nunedestore"], "samtandbyme": ["그로브:", "samtandbyme"],
+    "alico": ["앨리코", "alico"], "lanic-u": ["라닉유", "lanic-u"], "beaucla": ["뷰클래", "beaucla"],
+    "neulpumdaa": ["늘품다", "neulpumdaa"], "mou9": ["모우", "mou9"], "lasibelle": ["라씨벨", "lasibelle"], "carinowm": ["까리노쇼룸", "carinowm"]
 }
 # ✅ NEW: 셀러가 상품명 끝에 대괄호 없이 그냥 붙이는 자체 홍보 태그(예: "...아이보리 떠유니")를
 # AI에게 넘기기 전에 원천 제거하기 위한 패턴. 안 지우면 AI가 이걸 상품 고유 식별어로
