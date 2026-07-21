@@ -2,7 +2,7 @@ import json, requests, os
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()  # ✅ .env 파일에서 환경변수 로드
+load_dotenv()  # ✅ FIX: .env 파일에서 환경변수 로드
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 # ✅ FIX: anon key 대신 service_role(legacy) 또는 sb_secret_...(신규) key — RLS로 anon 직접 쓰기를 막았기 때문에 필요
@@ -36,6 +36,19 @@ DELETE_HEADERS = dict(_BASE_HEADERS)
 
 DATA_FILE = Path("./label_data/products.json")
 
+# ✅ NEW: 배치(묶음) 크기. products/store_links 삽입은 요청 바디에 실리므로 넉넉하게,
+# in.() 필터를 쓰는 삭제는 쿼리스트링 길이 제한이 있을 수 있어 보수적으로 작게 잡음.
+INSERT_BATCH = 300
+DELETE_BATCH = 80
+
+def chunked(lst, size):
+    for i in range(0, len(lst), size):
+        yield lst[i:i + size]
+
+def in_list(values):
+    # PostgREST in.() 필터 문법 — 공백/한글 등 특수문자가 있는 값은 큰따옴표로 감싸야 안전함
+    return "(" + ",".join(f'"{v}"' for v in values) + ")"
+
 def upload():
     if not DATA_FILE.exists():
         print("❌ 데이터 파일이 없습니다. 크롤러를 먼저 실행하세요.")
@@ -44,61 +57,58 @@ def upload():
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         products = json.load(f)
 
-    print(f"🚀 Supabase 업로드 시작 (upsert 방식 — click_count 보존) — 총 {len(products)}개 상품")
+    print(f"🚀 Supabase 업로드 시작 (배치 방식 — click_count 보존) — 총 {len(products)}개 상품")
 
-    success, fail = 0, 0
+    # ── 1. products 배치 upsert (product_id 충돌 시 병합 — click_count는 payload에 없으므로 보존됨) ──
+    p_success, p_fail = 0, 0
+    for batch in chunked(products, INSERT_BATCH):
+        payload = [{
+            "brand_name": p["brand_name"], "title": p["title"], "clean_title": p["clean_title"],
+            "image_url": p["image_url"], "product_id": p["product_id"], "crawled_at": p["crawled_at"]
+        } for p in batch]
+        res = requests.post(f"{SUPABASE_URL}/rest/v1/products?on_conflict=product_id", headers=UPSERT_HEADERS, json=payload)
+        if res.status_code not in (200, 201):
+            print(f"  ⚠️ products 배치 upsert 실패: {res.status_code} {res.text[:200]}")
+            p_fail += len(batch)
+        else:
+            p_success += len(batch)
+    print(f"  ✅ products upsert: 성공 {p_success} / 실패 {p_fail}")
 
+    # ── 2. 이번 크롤에 포함된 product_id들의 기존 store_links 배치 삭제 (product_id 기준) ──
+    all_pids = [p["product_id"] for p in products]
+    for batch in chunked(all_pids, DELETE_BATCH):
+        requests.delete(f"{SUPABASE_URL}/rest/v1/store_links", headers=DELETE_HEADERS,
+                         params={"product_id": f"in.{in_list(batch)}"})
+
+    # ── 3. 이번에 삽입할 모든 URL에 대해서도 배치 삭제 ──
+    # ✅ FIX(기존 유지): product_id 기준으로만 지우면, 예전 크롤링에서 이 URL이 다른(옛날) product_id
+    # 밑에 들어가 있었을 경우 그 유령 행이 안 지워지고 남아서 같은 URL이 두 상품에 동시에
+    # 존재하게 됨 — URL 자체를 기준으로도 지우면 항상 딱 1곳에만 존재하는 게 보장됨.
+    all_urls = [link["product_url"] for p in products for link in p["store_links"]]
+    for batch in chunked(all_urls, DELETE_BATCH):
+        requests.delete(f"{SUPABASE_URL}/rest/v1/store_links", headers=DELETE_HEADERS,
+                         params={"product_url": f"in.{in_list(batch)}"})
+
+    # ── 4. store_links 배치 삽입 ──
+    all_links_payload = []
     for p in products:
-        product_id = p["product_id"]
-
-        # 1. 상품(products) upsert — 전체 delete 대신 product_id 충돌 시 기존 행을 업데이트.
-        #    click_count는 payload에 아예 포함하지 않으므로 기존 값 그대로 보존됨.
-        prod_payload = {
-            "brand_name": p["brand_name"],
-            "title": p["title"],
-            "clean_title": p["clean_title"],
-            "image_url": p["image_url"],
-            "product_id": product_id,
-            "crawled_at": p["crawled_at"]
-        }
-        res_p = requests.post(
-            f"{SUPABASE_URL}/rest/v1/products?on_conflict=product_id",
-            headers=UPSERT_HEADERS, json=prod_payload
-        )
-        if res_p.status_code not in (200, 201):
-            print(f"  ⚠️ products upsert 실패: {product_id} ({res_p.status_code}) {res_p.text[:200]}")
-            fail += 1
-            continue
-
-        # 2. store_links는 이 상품(product_id) 것만 지우고 재삽입 (테이블 전체 삭제 아님)
-        requests.delete(
-            f"{SUPABASE_URL}/rest/v1/store_links?product_id=eq.{product_id}",
-            headers=DELETE_HEADERS
-        )
         for link in p["store_links"]:
-            # ✅ FIX: product_id 기준으로만 지우면, 예전 크롤링에서 이 URL이 다른(옛날) product_id
-            # 밑에 들어가 있었을 경우 그 유령 행이 안 지워지고 남아서 같은 URL이 두 상품에 동시에
-            # 존재하게 됨 — 다음 크롤링의 "기존 링크 고정 배정" 로직이 어느 쪽이 맞는지 못 정함.
-            # URL 자체를 기준으로 지우면 항상 딱 1곳에만 존재하는 게 보장됨.
-            requests.delete(
-                f"{SUPABASE_URL}/rest/v1/store_links",
-                headers=DELETE_HEADERS,
-                params={"product_url": f"eq.{link['product_url']}"}
-            )
-            link_payload = {
-                "product_id": product_id,
-                "store_name": link["store_name"],
-                "store_id": link["store_id"],
-                "price": link["price"],
-                "product_url": link["product_url"],
-                "store_title": link.get("store_title", ""),
-                "store_image": link.get("store_image", "")
-            }
-            requests.post(f"{SUPABASE_URL}/rest/v1/store_links", headers=WRITE_HEADERS, json=link_payload)
+            all_links_payload.append({
+                "product_id": p["product_id"], "store_name": link["store_name"], "store_id": link["store_id"],
+                "price": link["price"], "product_url": link["product_url"],
+                "store_title": link.get("store_title", ""), "store_image": link.get("store_image", "")
+            })
 
-        success += 1
+    l_success, l_fail = 0, 0
+    for batch in chunked(all_links_payload, INSERT_BATCH):
+        res = requests.post(f"{SUPABASE_URL}/rest/v1/store_links", headers=WRITE_HEADERS, json=batch)
+        if res.status_code not in (200, 201):
+            print(f"  ⚠️ store_links 배치 삽입 실패: {res.status_code} {res.text[:200]}")
+            l_fail += len(batch)
+        else:
+            l_success += len(batch)
 
-    print(f"\n🎉 업로드 완료! 성공 {success}개 / 실패 {fail}개 (click_count 보존됨)")
+    print(f"\n🎉 업로드 완료! products {p_success}/{len(products)} · store_links {l_success}/{len(all_links_payload)} (click_count 보존됨)")
 
     dedupe_existing_duplicates()
 
@@ -124,7 +134,7 @@ def fetch_all(table, select, extra_params=None):
 
 def dedupe_existing_duplicates():
     """
-    ✅ NEW: 업로드 끝날 때마다 자동 실행되는 사후 정리.
+    업로드 끝날 때마다 자동 실행되는 사후 정리.
     같은 product_url(스토어 링크)이 서로 다른 product_id 밑에 동시에 존재하면
     (AI가 크롤링마다 상품명을 조금씩 다르게 뽑아서 예전에 갈라진 경우 등),
     그건 100% 같은 상품이 갈라진 것이므로 자동으로 하나로 합친다.
