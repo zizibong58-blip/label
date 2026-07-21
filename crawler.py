@@ -363,7 +363,18 @@ def run():
                 matched = [(raw_title_lower.find(b_lower), b) for b, b_lower in zip(brands, brand_lower_list) if b_lower in raw_title_lower]
                 if matched:
                     brand_pos, b = min(matched, key=lambda x: x[0])
-                    trimmed_title = raw_title[brand_pos:] if brand_pos > 0 else raw_title
+                    # ✅ FIX: 예전엔 공백제거 문자열의 인덱스(brand_pos)를 공백 있는 원본에 그대로
+                    # 적용해서 trimmed가 엉뚱한 위치에서 잘렸음(예: "...블라우스 플라워 펀칭"처럼
+                    # 카테고리 단어가 맨 앞에 오게 됨 -> salvage가 스타일명을 못 뽑아 "블라우스"만 남음).
+                    # 원본을 단어 단위로 쪼개서, 브랜드명이 들어있는 단어부터 잘라낸다.
+                    b_lower = b.replace(" ", "").lower()
+                    words = raw_title.split()
+                    cut_idx = 0
+                    for wi, w in enumerate(words):
+                        if b_lower in w.replace(" ", "").lower():
+                            cut_idx = wi
+                            break
+                    trimmed_title = " ".join(words[cut_idx:]) if words else raw_title
 
                     titles_by_brand.setdefault(b, set()).add(trimmed_title)
                     # ✅ NEW: 예전엔 seen_raw_titles로 "이미 나온 제목"이면 통째로 버려서,
