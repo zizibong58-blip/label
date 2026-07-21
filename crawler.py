@@ -28,6 +28,22 @@ SKIP_LOCAL_IMAGE_DOWNLOAD = os.environ.get("SKIP_LOCAL_IMAGE_DOWNLOAD", "false")
 
 genai.configure(api_key=GEMINI_API_KEY)
 ai_model = genai.GenerativeModel('gemini-2.5-flash', generation_config={"response_mime_type": "application/json", "temperature": 0})
+
+# ✅ NEW: gemini-2.5-flash 무료 티어는 분당 약 10회(RPM) 제한. 기존엔 3초 간격(분당 20회)으로
+# 한도를 2배 넘겨서, 429(RESOURCE_EXHAUSTED)로 실패 → 재시도(5초/10초 대기)가 반복되며
+# 시간이 눈덩이처럼 불어나는 원인이었음(실제로 크롤링 1회에 1시간 넘게 걸림).
+# 병렬로 더 쏘는 건 도움 안 됨 — 이 한도는 프로젝트 단위라 동시에 여러 개 쏴도 총량은 그대로 막힘.
+# 대신 호출 간격을 한도 안쪽으로 정확히 맞춰서, 애초에 실패/재시도 자체가 안 나게 만드는 게 핵심.
+_last_gemini_call = [0.0]
+_GEMINI_MIN_INTERVAL = 6.5  # 분당 10회 한도 대비 여유를 둔 안전 간격(분당 약 9.2회)
+
+def _gemini_call(prompt):
+    elapsed = time.time() - _last_gemini_call[0]
+    if elapsed < _GEMINI_MIN_INTERVAL:
+        time.sleep(_GEMINI_MIN_INTERVAL - elapsed)
+    _last_gemini_call[0] = time.time()
+    return ai_model.generate_content(prompt)
+
 # ✅ FIX: Supabase가 신규 키 체계(sb_secret_...)를 도입 — 이건 JWT가 아니라서
 # Authorization: Bearer 헤더에 넣으면 거부됨. apikey 헤더에만 넣어야 함.
 # 예전 JWT 기반 service_role 키(eyJ...)는 계속 Authorization 헤더도 필요해서 키 형식으로 자동 분기.
@@ -248,7 +264,7 @@ def clean_titles_with_ai(titles_by_brand):
             success = False
             for attempt in range(3):
                 try:
-                    res = ai_model.generate_content(prompt)
+                    res = _gemini_call(prompt)
                     parsed = json.loads(res.text)
                     batch_set = set(batch)
                     for p in parsed:
@@ -272,7 +288,6 @@ def clean_titles_with_ai(titles_by_brand):
                 print(f"  ❌ [{brand}] 3회 재시도 실패 — 이 배치는 원본 제목이 그대로 저장됩니다.")
                 for t in batch: cleaned_dict[t] = t
             print(f"  [{brand}] {min(i+batch_size, len(unique_titles))}/{len(unique_titles)} 분석 완료...")
-            time.sleep(3)
     return cleaned_dict
 
 def run():
