@@ -163,7 +163,9 @@ def search_naver(keyword, cat=None, display=100, sort="date", start=1):
     headers = {"X-Naver-Client-Id": NAVER_CLIENT_ID, "X-Naver-Client-Secret": NAVER_CLIENT_SECRET}
     params = {"query": keyword, "display": display, "sort": sort, "start": start}
     if cat: params["category"] = cat
-    try: return requests.get("https://openapi.naver.com/v1/search/shop.json", headers=headers, params=params).json().get("items", [])
+    # ✅ FIX: timeout 필수 — 없으면 병렬 요청 중 하나라도 네이버가 응답을 안 줄 때
+    # 그 스레드가 영원히 대기해서 크롤링 전체가 멈춤(hang)이 됨. 실제로 이것 때문에 멈췄었음.
+    try: return requests.get("https://openapi.naver.com/v1/search/shop.json", headers=headers, params=params, timeout=15).json().get("items", [])
     except: return []
 
 def download_image(url, product_id):
@@ -604,7 +606,10 @@ def run():
         return (brand, clean_title, items)
 
     unique_items_list = list(unique_items)
-    with ThreadPoolExecutor(max_workers=15) as executor:
+    # ✅ FIX: max_workers 15 -> 4. 네이버 쇼핑 API는 같은 IP에서 동시 요청이 많으면
+    # 응답을 지연시키거나 막음. 15는 너무 공격적이라 hang의 원인이 됐음. 4면 순차보다
+    # 충분히 빠르면서 안정적. (타임아웃도 걸어놨으니 하나 막혀도 전체는 안 멈춤)
+    with ThreadPoolExecutor(max_workers=4) as executor:
         phase2_results = list(executor.map(_fetch_phase2, unique_items_list))
 
     for brand, clean_title, items in phase2_results:
@@ -678,7 +683,8 @@ def run():
 
     # ✅ NEW: 리뷰 수집(네트워크 I/O)만 병렬로 — 상품끼리 서로 독립적이라 동시에 여러 개 쏴도 안전함.
     # 순차로 하나씩 하면 1500개 기준 15~25분씩 걸리던 게 크롤링 전체 시간의 큰 부분을 차지했음.
-    with ThreadPoolExecutor(max_workers=20) as executor:
+    # ✅ FIX: max_workers 20 -> 6. 리뷰 API도 동시요청 폭주 시 지연/차단 가능. 6이면 안정적.
+    with ThreadPoolExecutor(max_workers=6) as executor:
         review_results = list(executor.map(lambda item: get_reviews(item[1]), prep_items))
 
     for (p, _), reviews in zip(prep_items, review_results):
