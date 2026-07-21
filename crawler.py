@@ -188,7 +188,7 @@ def get_reviews(product_id, count=5):
 
 def clean_titles_with_ai(titles_by_brand):
     total_titles = sum(len(v) for v in titles_by_brand.values())
-    print(f"\n🤖 제미나이 AI가 {len(titles_by_brand)}개 브랜드, 총 {total_titles}개의 상품명을 분석합니다...")
+    print(f"\n🤖 제미나이 AI가 {len(titles_by_brand)}개 브랜드, 총 {total_titles}개의 상품명을 분석합니다...", flush=True)
     cleaned_dict = {}
     all_store_aliases = set()
     for alias_list in STORE_MAPPING.values():
@@ -312,14 +312,26 @@ def run():
 
     # ✅ FIX: 예전엔 CATEGORIES(50000167/50000190/50000174) 3개 코드로만 검색을 좁혔는데,
     # 네이버 자체 분류(예: "티셔츠")가 이 3개 안에 없으면 그 카테고리의 상품은
-    # 해당 스토어가 아무리 많이 팔아도 1단계에서 원천적으로 아예 검색조차 안 됐음
-    # (실제로 미엘 베이비나시 = "패션의류>여성의류>티셔츠"라서 통째로 누락된 게 확인됨).
+    # 해당 스토어가 아무리 많이 팔아도 1단계에서 원천적으로 아예 검색조차 안 됐음.
     # 카테고리로 좁히는 대신, 페이지(start)를 늘려서 카테고리 무관하게 최근 300개를 모두 훑는다.
-    for sid in extended_store_ids:
+    # ✅ FIX: 예전엔 스토어별로 순차 검색해서, 네이버가 느리면(타임아웃 15초씩) 72번 호출이
+    # 최대 18분+까지 늘어져 크롤링 초반부터 하염없이 대기했음. 검색(네트워크)만 병렬로 먼저
+    # 다 가져오고, 데이터 처리는 순차로 안전하게 유지한다. 진행 로그도 찍어서 멈춤 여부를 눈으로 확인.
+    print(f"🔎 1단계: {len(extended_store_ids)}개 스토어 검색 시작...", flush=True)
+
+    def _fetch_store(sid):
         search_kw = STORE_MAPPING.get(sid, [sid])[0]
+        results = []
         for start in (1, 101, 201):
-            items = search_naver(search_kw, cat=None, display=100, sort="date", start=start)
-            for item in items:
+            results.extend(search_naver(search_kw, cat=None, display=100, sort="date", start=start))
+        return (sid, results)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        store_fetch_results = list(executor.map(_fetch_store, extended_store_ids))
+    print(f"✅ 1단계 검색 완료 — 이제 브랜드 매칭 중...", flush=True)
+
+    for sid, items in store_fetch_results:
+        for item in items:
                 mall_name, link = item.get("mallName", ""), item.get("link", "")
                 if not is_target_store(mall_name, link, store_ids) == sid: continue
                 
@@ -339,8 +351,6 @@ def run():
                 raw_title_lower = raw_title.replace(" ", "").lower()
                 # ✅ FIX: 대괄호 태그를 이미 제거했으므로, 남은 텍스트에서 여러 브랜드가 동시에
                 # 매칭되더라도 가장 먼저(앞에) 나오는 브랜드가 진짜 도매택이다.
-                # ("코드/영문표기 + 진짜브랜드 + 상품명 + 카테고리" 순서가 일관된 패턴이라
-                # 뒤에 나오는 매칭은 다른 브랜드명과 우연히 겹치는 상품명/디테일어인 경우가 많음)
                 matched = [(raw_title_lower.find(b_lower), b) for b, b_lower in zip(brands, brand_lower_list) if b_lower in raw_title_lower]
                 if matched:
                     brand_pos, b = min(matched, key=lambda x: x[0])
@@ -358,7 +368,6 @@ def run():
                             "naver_product_id": item.get("productId", ""),
                             "store_title": raw_title
                         })
-        time.sleep(0.3)
 
     cleaned_map = clean_titles_with_ai(titles_by_brand) if titles_by_brand else {}
 
