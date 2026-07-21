@@ -42,7 +42,10 @@ def _gemini_call(prompt):
     if elapsed < _GEMINI_MIN_INTERVAL:
         time.sleep(_GEMINI_MIN_INTERVAL - elapsed)
     _last_gemini_call[0] = time.time()
-    return ai_model.generate_content(prompt)
+    # ✅ FIX: request_options로 타임아웃(90초) 필수. 없으면 Gemini가 응답을 안 줄 때
+    # 무한 대기(hang)해서 크롤링 전체가 멈춤 — 실제로 이것 때문에 정제 단계 첫 배치에서 멈췄었음.
+    # 타임아웃 초과 시 예외 발생 -> 아래 배치 재시도 로직이 받아서 처리함.
+    return ai_model.generate_content(prompt, request_options={"timeout": 90})
 
 # ✅ FIX: Supabase가 신규 키 체계(sb_secret_...)를 도입 — 이건 JWT가 아니라서
 # Authorization: Bearer 헤더에 넣으면 거부됨. apikey 헤더에만 넣어야 함.
@@ -284,12 +287,12 @@ def clean_titles_with_ai(titles_by_brand):
                     break
                 except Exception as e:
                     if attempt < 2:
-                        print(f"  ⚠️ [{brand}] 배치 실패({e}), 재시도 {attempt+1}/2...")
+                        print(f"  ⚠️ [{brand}] 배치 실패({e}), 재시도 {attempt+1}/2...", flush=True)
                         time.sleep(5 * (attempt + 1))
             if not success:
-                print(f"  ❌ [{brand}] 3회 재시도 실패 — 이 배치는 원본 제목이 그대로 저장됩니다.")
+                print(f"  ❌ [{brand}] 3회 재시도 실패 — 이 배치는 원본 제목이 그대로 저장됩니다.", flush=True)
                 for t in batch: cleaned_dict[t] = t
-            print(f"  [{brand}] {min(i+batch_size, len(unique_titles))}/{len(unique_titles)} 분석 완료...")
+            print(f"  [{brand}] {min(i+batch_size, len(unique_titles))}/{len(unique_titles)} 분석 완료...", flush=True)
     return cleaned_dict
 
 def run():
