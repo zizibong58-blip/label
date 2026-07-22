@@ -313,6 +313,14 @@ def run():
     merge_rules = get_merge_rules()   # ✅ FIX
     blacklist = get_blacklist()       # ✅ FIX
     existing_links = get_existing_links()  # ✅ NEW: 링크별 기존 배정 상품+스토어 정보 고정/복원용
+    # ✅ FIX: existing_links 고정은 원래 "admin이 병합/이름수정으로 확정한 product_id를 지켜주기" 위한 장치인데,
+    # 지금까지는 조건 없이 "예전에 크롤러가 (버그로든 뭐든) 배정한 적 있는 product_id"까지 전부 고정시켜버렸음.
+    # 그 결과 정제 로직을 고쳐도 예전 버그로 잘못 갈라진 그룹("블라우스 블라우스" 등)이 영원히 안 고쳐졌음.
+    # -> admin이 실제로 확정한 그룹(=병합/분리/이름수정의 '목적지')만 보호 대상으로 삼는다.
+    #    (rename_rules는 keys가 '바꾸기 전 옛 이름'이므로 values(=확정된 새 이름)를 써야 함)
+    admin_protected_ids = {v.strip() for v in rename_rules.values() if "|" in v}
+    admin_protected_ids |= {v.strip() for v in merge_rules.values() if "|" in v}
+    admin_protected_ids |= {v.strip() for v in split_rules.values() if "|" in v}
     print(f"🚀 LABEL V2 가동 (도매택 {len(brands)}개 / 소매상 {len(store_ids)}개 / 휴먼분리 {len(split_rules)}건 / 병합 {len(merge_rules)}건 / 블랙리스트 {len(blacklist)}건 적용)\n")
     
     brand_lower_list = [b.replace(" ", "").lower() for b in brands]
@@ -566,9 +574,10 @@ def run():
                 forced_brand, forced_clean_title = forced_title.split("|", 1)
                 if brand != forced_brand.strip() or clean_title != forced_clean_title.strip(): return
                 dedup_key = forced_title
-            elif clean_link in existing_links:
-                # 이 링크는 예전 크롤링에서 이미 어떤 상품에 배정된 적이 있음. 이번 AI 정제 결과가
-                # 그때와 다르게 나왔어도 무시하고 기존 product_id를 그대로 사용.
+            elif clean_link in existing_links and existing_links[clean_link]['product_id'] in admin_protected_ids:
+                # ✅ FIX: admin이 이 product_id를 실제로 손댄 적(rename/merge/split) 있을 때만 고정.
+                # 그냥 예전 크롤링에서 우연히(혹은 버그로) 배정됐을 뿐인 경우는 고정하지 않고
+                # 아래 else로 내려가서 이번 정제 결과로 새로 계산되게 둔다 — 정제 로직 개선이 실제로 반영되도록.
                 dedup_key = existing_links[clean_link]['product_id']
             else:
                 if validate_title:
