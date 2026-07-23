@@ -321,7 +321,49 @@ def run():
     admin_protected_ids = {v.strip() for v in rename_rules.values() if "|" in v}
     admin_protected_ids |= {v.strip() for v in merge_rules.values() if "|" in v}
     admin_protected_ids |= {v.strip() for v in split_rules.values() if "|" in v}
-    print(f"🚀 LABEL V2 가동 (도매택 {len(brands)}개 / 소매상 {len(store_ids)}개 / 휴먼분리 {len(split_rules)}건 / 병합 {len(merge_rules)}건 / 블랙리스트 {len(blacklist)}건 적용)\n")
+
+    # ✅ NEW: admin이 확정한 상품명(rename_rules.correct_title / merge_rules.target_clean_title /
+    # split_rules.correct_title)을 (브랜드, 스타일명) -> "스타일명 카테고리" 정제 사전으로 만든다.
+    # 목적: CATEGORY_WORDS(의류 10종)에 없는 카테고리(가방/신발/파우치/액세서리 등)의 상품이
+    # resolve_style_and_category의 최후 폴백 'cat = style'을 타서 "블랑|큐비 큐비"처럼 이름이
+    # 깨지던 문제를 차단. 잡화 브랜드(블랑 등)는 카테고리 단어가 CATEGORY_WORDS에 없어 100% 이
+    # 폴백을 탔음. CATEGORY_WORDS를 단순 확장하는 대신 admin 확정 이름을 그대로 채택하면,
+    # 계산된 clean_title이 곧 admin 확정 product_id의 상품명 부분과 일치하므로
+    # rename/merge/split 규칙의 목적지("브랜드|스타일명 카테고리")도 그대로 유효하게 유지됨.
+    #
+    # 충돌 방어: 같은 (브랜드, 스타일명)이 서로 다른 확정 상품명을 가리키면(진짜 다른 상품 —
+    # 리터|뮤·미엘|리프 등, 또는 admin 표기 흔들림 — 포레스트|케이트 등) 그 키는 사전에서 제외해
+    # 기존 로직에 맡긴다. 잘못 통합하느니 안 건드리는 쪽이 안전. (favorites 0 / click_count 최대 2라
+    # 마이그레이션 부담 없음.) 값 불일치를 자동 감지하므로 충돌 12건을 하드코딩하지 않아도 됨.
+    admin_refine_map = {}
+    _refine_conflicts = set()
+    def _register_refine(confirmed_title):
+        # merge_rules 목적지 중엔 "브랜드|" 접두어 없이 저장된 값(예: "캉스 스커트")이 섞여 있음.
+        # (브랜드, 스타일명) 키를 만들 수 없으므로 방어적으로 건너뜀.
+        if not confirmed_title or "|" not in confirmed_title:
+            return
+        brand_part, product_part = confirmed_title.split("|", 1)
+        brand_part = brand_part.strip()
+        product_part = product_part.strip()
+        parts = product_part.split()
+        if not brand_part or not parts:
+            return
+        key = (brand_part, parts[0])          # (브랜드, 스타일명키워드)
+        if key in _refine_conflicts:
+            return
+        prev = admin_refine_map.get(key)
+        if prev is not None and prev != product_part:
+            # 같은 스타일명이 서로 다른 확정 상품명을 가리킴 -> 충돌. 양쪽 다 제외.
+            _refine_conflicts.add(key)
+            admin_refine_map.pop(key, None)
+            return
+        admin_refine_map[key] = product_part
+    for _t in rename_rules.values(): _register_refine(_t)
+    for _t in merge_rules.values():  _register_refine(_t)
+    for _t in split_rules.values():  _register_refine(_t)
+
+    print(f"🚀 LABEL V2 가동 (도매택 {len(brands)}개 / 소매상 {len(store_ids)}개 / 휴먼분리 {len(split_rules)}건 / 병합 {len(merge_rules)}건 / 블랙리스트 {len(blacklist)}건 적용)")
+    print(f"   🧷 admin 확정 이름 정제 사전 {len(admin_refine_map)}건 적용 (충돌 제외 {len(_refine_conflicts)}건)\n")
     
     brand_lower_list = [b.replace(" ", "").lower() for b in brands]
     titles_by_brand = {}
@@ -481,6 +523,17 @@ def run():
                 if cw in raw_ns:
                     cat = cw
                     break
+        # 4.5) ✅ admin 확정 이름 우선 적용 (아래 'cat = style' 폴백보다 앞).
+        #      admin이 rename/merge/split로 확정한 (브랜드, 스타일명)이면 그 확정 상품명을
+        #      통째로 채택한다. 잡화(가방/파우치/신발/액세서리 등) 카테고리가 CATEGORY_WORDS에
+        #      없어 cat=None으로 떨어져도, 여기서 "큐비 파우치"처럼 확정 이름으로 복원되어
+        #      최후 폴백('큐비 큐비')을 타지 않는다. (충돌 키는 admin_refine_map에서 이미 제외됨)
+        if style:
+            refined = admin_refine_map.get((brand_b, style))
+            if refined:
+                r_parts = refined.split()
+                r_cat = r_parts[-1] if len(r_parts) > 1 else r_parts[0]
+                return (r_parts[0], r_cat, True)
         # 5) 스타일명이 없으면(=카테고리 단어밖에 안 남음) 유효하지 않음 → 병합 후보로만
         if not style:
             return (None, cat, False)
